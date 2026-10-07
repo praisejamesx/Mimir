@@ -1,0 +1,20 @@
+# MIMIR - Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Bulky data (20 GB LibriBrain, MNE sample bundle) stays out of git.
+data/
+mimir/checkpoints/
+
+# Pinned competition SDK (installed editable into baseline/), not part of this
+# repo's product.
+baseline/
+
+# Competition artifacts.
+*.pt
+submission_*.csv
+
+# Tooling.
+.idea/
+.vscode/

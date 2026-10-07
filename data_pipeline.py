@@ -100,7 +100,7 @@ MNE_SEED = 0
 # export in the Kaggle notebook takes effect immediately.
 def _data_root() -> Path:
     env = os.environ.get("MIMIR_DATA_ROOT") or os.environ.get("KAGGLE_DATA_PATH")
-    return Path(env) if env else (Path(__file__).resolve().parent.parent / "data")
+    return Path(env) if env else (Path(__file__).resolve().parent / "data")
 
 
 # ----------------------------------------------------------------------------

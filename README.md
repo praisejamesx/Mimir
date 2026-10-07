@@ -30,7 +30,6 @@ Verifies the whole contract (tensor shapes, dual heads, augmentation gating, gra
 
 ```bash
 conda activate mimir
-cd mimir
 python -u train.py          # one epoch on the MNE sample data
 python -u data_pipeline.py  # optional: batch-contract self-test
 python -u mimir_model.py    # optional: shape/RF/ablation self-test
@@ -40,10 +39,9 @@ python -u mimir_model.py    # optional: shape/RF/ablation self-test
 
 1. Set `USE_REAL_DATA = True` at the top of `data_pipeline.py` (a single switch; `train.py` reads it).
 2. Point the data root at the head of the run. By default data lives in `<repo>/data`; override with `MIMIR_DATA_ROOT` (or `KAGGLE_DATA_PATH`) - e.g. an exported Kaggle dataset mount such as `/kaggle/input/libribrain100`.
-3. Train. The first run downloads ~20 GB of LibriBrain100 into the data root and caches pnpl standardization stats in the H5 metadata. Up to 20 epochs with a seeded 90/10 validation split, early stopping (patience 3), best checkpoint at `mimir/checkpoints/mimir_libri_best.pt`.
+3. Train. The first run downloads ~20 GB of LibriBrain100 into the data root and caches pnpl standardization stats in the H5 metadata. Up to 20 epochs with a seeded 90/10 validation split, early stopping (patience 3), best checkpoint at `checkpoints/mimir_libri_best.pt`.
 
 ```bash
-cd mimir
 python -u train.py           # cloud mode
 python -u submit.py          # writes submission_deep.csv (full softmax, both heads)
 ```
@@ -68,4 +66,4 @@ Toggle the flags at the top of `mimir_model.py` (or pass `use_gcn=...` / `use_tc
 - **No leakage**: z-score statistics are fit on train trials/split only (MNE path: split-then-fit; LibriBrain path: pnpl standardizes over its train partition and caches the stats).
 - **Sensor graph**: LibriBrain runs carry their real channel names in the H5 metadata; `data_pipeline` name-matches them onto MNE's canonical Neuromag 306 positions (concentric mag + 2 planar-grad triplets handled by location-deduplication in the k-NN). Fallback to the canonical 306 order if metadata is unreadable.
 - **num_workers=0** throughout: the pnpl dataset holds open HDF5 handles and a per-sample cache; worker processes would fork them for no throughput gain on a 4-vCPU box.
-- `data/`, `mimir/checkpoints/`, `*.pt`, `*.csv` and `__pycache__` are git-ignored (see `.gitignore`).
+- `data/`, `checkpoints/`, `*.pt`, `*.csv` and `__pycache__` are git-ignored (see `.gitignore`).

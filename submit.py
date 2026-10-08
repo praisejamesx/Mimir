@@ -107,6 +107,13 @@ def main() -> None:
     with torch.no_grad():
         for batch, _ in holdout.iter_windows(batch_size=SUBMIT_BATCH_SIZE):
             x = torch.from_numpy(batch).float()          # (B, 306, 250)
+
+            # Apply per-channel z-scoring to match training preprocessing
+            # Raw MEG data causes activations to vanish; the model expects whitened data.
+            x_mean = x.mean(dim=2, keepdim=True)
+            x_std = x.std(dim=2, keepdim=True)
+            x = (x - x_mean) / (x_std + 1e-6)
+                                
             logits_p, logits_m = model(x)                # (B, 50), (B, 50)
             primary_blocks.append(torch.softmax(logits_p, dim=1).numpy())
             moses_blocks.append(torch.softmax(logits_m, dim=1).numpy())

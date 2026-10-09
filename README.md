@@ -26,7 +26,7 @@ pip install "pnpl @ git+https://github.com/neural-processing-lab/pnpl"  # compet
 
 ### Local smoke test
 
-Verifies the whole contract (tensor shapes, dual heads, augmentation gating, gradient flow, RAM) with the MNE `sample` auditory dataset, about 2 minutes on the current machine:
+Verifies the whole contract (tensor shapes, dual heads, augmentation gating, gradient flow, RAM) with the MNE `sample` auditory dataset, about 2 minutes on CPU:
 
 ```bash
 conda activate mimir
@@ -49,9 +49,9 @@ python -u submit.py                             # writes submission_deep.csv (ex
 ```
 
 The checkpoint stores the training `mean`/`std`/`clip` so `submit.py` reproduces the 
-exact inference transform on the raw holdout signal (no per-window z-scoring, no 
-`standardize=` kwarg - that path produced a data-blind bias-only CSV with a balanced 
-Top-10 of 0.200, exactly chance).
+exact inference transform on the raw holdout signal (the holdout is served in raw SI 
+units - per-window z-scoring is not applied; the training transform is what runs at 
+inference).
 
 > Diagnostics: `train_Top10` (plain, first 800 batches) and `val_bal_Top10` (balanced,
 > chance = 0.020 per class average). If `train_Top10` climbs well past 0.2 while
@@ -67,6 +67,10 @@ pipeline (train -> exact-transform inference -> diversity-guarded CSV):
 ```bash
 python -u kaggle_run.py --budget-hours 5 --limit 25000 --epochs 12 --patience 4
 ```
+
+The full copy-paste notebook cell (with an upload-first, token-backed-clone
+fallback for getting the scripts into a notebook) is in
+**`kaggle_master_cell.md`**.
 
 It is what the notebook's single "master cell" calls. Flags: `--budget-hours`
 (total wall-clock, leaves ~0.4 h headroom), `--limit` (hard cap on training

@@ -80,10 +80,9 @@ def main() -> None:
     mean, std, clip = meta.get("mean"), meta.get("std"), meta.get("clip")
     if mean is None or std is None:
         raise RuntimeError(
-            "checkpoint predates train-stat persistence (meta.mean/std are None). "
-            "This model was trained on a broken pipeline and produces a "
-            "data-blind bias-only CSV (Bal@10 = 0.200, chance). Retrain with the "
-            "current pipeline before submitting."
+            "checkpoint predates train-stat persistence (meta.mean/std are None); "
+            "without them the holdout would be scored untransformed (bias-only). "
+            "Retrain with the current pipeline before submitting."
         )
     mean = torch.as_tensor(np.asarray(mean, dtype=np.float32))   # (C,)
     std = torch.as_tensor(np.asarray(std, dtype=np.float32))     # (C,)
@@ -131,10 +130,10 @@ def main() -> None:
     if not args.no_sanity:
         if n_unique_argmax < 2 or col_std < 1e-3:
             raise RuntimeError(
-                "predictions look data-blind (bias-only prior): every row "
-                f"collapses to the same top-10 (unique argmax={n_unique_argmax}, "
-                f"column-std={col_std:.2e}). This is the 0.20000 submission. "
-                "Refuse to write it; pass --no-sanity to force."
+                "predictions look bias-only: every row collapses to the same "
+                f"top-10 (unique argmax={n_unique_argmax}, "
+                f"column-std={col_std:.2e}). Refuse to write it; pass "
+                "--no-sanity to force."
             )
 
     # ---- 6. Write ------------------------------------------------------------

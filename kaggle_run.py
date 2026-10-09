@@ -6,10 +6,11 @@ inference on the holdout -> write submission with a data-blind guard.
 
 Why auto-size: the deep subject holds far more in-vocab word windows than a
 CPU session can chew through. Caching that dataset would need ~30 GB+, and at
-our measured ~0.1-0.17 s/window a full-data epoch is multiple hours. So this
-script measures the live throughput once, then solves for the largest window
-count AND epoch count whose combined epoch time fits budget hours (leaving
-headroom for install/preload/submit), and prints the plan before committing.
+~0.1-0.17 s/window (measured on a Kaggle CPU session) a full-data epoch is
+multiple hours. So this script measures the live throughput once, then solves
+for the largest window count AND epoch count whose combined epoch time fits
+budget hours (leaving headroom for install/preload/submit), and prints the
+plan before committing.
 
 Usage (from the repo root, USE_REAL_DATA defaults handled here):
 
@@ -263,7 +264,7 @@ def main() -> None:
           f"~{plan['epoch_h']:.2f}h/epoch)")
     print(f"  total   : ~{plan['train_h']:.1f}h train + ~0.4h build/submit "
           f"vs {plan['budget_h']:.1f}h budget")
-    print("  NOTE: if windows dropped below full, we are capping by "
+    print("  NOTE: if windows dropped below full, they are capped by "
           "RAM/budget; more budget (--budget-hours) or a faster box changes it.\n")
 
     run_training(plan, args)
@@ -272,7 +273,7 @@ def main() -> None:
         run_submission(args)
         print(f"\n[kaggle_run] DONE - submission at {args.submission}")
         print("[kaggle_run] upload it from the notebook Output tab or the "
-              "competition page (submissions close 15 Oct 2026 AoE).")
+              "competition page.")
     else:
         print("\n[kaggle_run] DONE - training only (--no-submit); "
               "run submit.py manually.")

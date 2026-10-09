@@ -7,9 +7,9 @@ MIMIR is a compact dual-head MEG decoder for the PNPL 2026 Deep Track (LibriBrai
 | File | Purpose |
 |------|---------|
 | `mimir_model.py` | Architecture (whiten - GCN - TCN - two heads). Ablation flags `USE_GCN`, `USE_TCN` at the top of the file. |
-| `data_pipeline.py` | Dual loader (MNE sample locally, LibriBrain100 on Kaggle) + geometric sensor adjacency. Per-channel z-scoring is fit on the **train** split only (no leakage). |
-| `train.py` | Training loop; reads `USE_GCN` / `USE_TCN` from `mimir_model.py`. |
-| `submit.py` | Rebuilds the model from a checkpoint and writes the submission CSV (full softmax over both heads). |
+| `data_pipeline.py` | Dual loader (MNE sample locally, LibriBrain100 on Kaggle) + geometric sensor adjacency. Per-channel z-scoring is fit on the **train** split only (no leakage); optional `CACHE_WINDOWS=1` RAM preload that removes the per-step H5 reads that dominated Kaggle epoch time. |
+| `train.py` | Training loop; reads `USE_GCN` / `USE_TCN` from `mimir_model.py`. Logs **train/val Top-10 recall** (plain + balanced) and anneals the LR cosinely. |
+| `submit.py` | Rebuilds the model from a checkpoint, applies the exact training transform (`(x - mean)/std` then clip) from the checkpoint meta, and writes the submission CSV. Refuses to write a data-blind (bias-only) CSV. |
 
 ## Setup
 
@@ -39,12 +39,24 @@ python -u mimir_model.py    # optional: shape/RF/ablation self-test
 
 1. Set `USE_REAL_DATA = True` at the top of `data_pipeline.py` (a single switch; `train.py` reads it).
 2. Point the data root at the head of the run. By default data lives in `<repo>/data`; override with `MIMIR_DATA_ROOT` (or `KAGGLE_DATA_PATH`) - e.g. an exported Kaggle dataset mount such as `/kaggle/input/libribrain100`.
-3. Train. The first run downloads ~20 GB of LibriBrain100 into the data root and caches pnpl standardization stats in the H5 metadata. Up to 20 epochs with a seeded 90/10 validation split, early stopping (patience 3), best checkpoint at `checkpoints/mimir_libri_best.pt`.
+3. Train. The first run downloads ~20 GB of LibriBrain100 into the data root and caches pnpl standardization stats in the H5 metadata. The standardized windows are then **RAM-preloaded once** (`CACHE_WINDOWS=1`, the default) so every epoch reads from memory instead of the H5 files - this is what makes multiple epochs feasible on Kaggle CPU.
 
 ```bash
-python -u train.py           # cloud mode
-python -u submit.py          # writes submission_deep.csv (full softmax, both heads)
+export CACHE_WINDOWS=1                          # default; RAM-cache standardized windows
+python -u train.py --epochs 8 --patience 4      # probe: watch train_Top10 / val_bal_Top10
+python -u train.py --epochs 20 --patience 5     # full run (cosine LR) -> best checkpoint
+python -u submit.py                             # writes submission_deep.csv (exact transform)
 ```
+
+The checkpoint stores the training `mean`/`std`/`clip` so `submit.py` reproduces the 
+exact inference transform on the raw holdout signal (no per-window z-scoring, no 
+`standardize=` kwarg - that path produced a data-blind bias-only CSV with a balanced 
+Top-10 of 0.200, exactly chance).
+
+> Diagnostics: `train_Top10` (plain, first 800 batches) and `val_bal_Top10` (balanced,
+> chance = 0.020 per class average). If `train_Top10` climbs well past 0.2 while
+> `val_bal_Top10` follows, the model is genuinely decoding; extend epochs. If both stay
+> ~0.2 the run is still fitting the word-frequency prior - keep training.
 
 ### Ablation runs
 

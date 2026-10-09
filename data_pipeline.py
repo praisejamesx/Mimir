@@ -82,6 +82,15 @@ LIBRI_BATCH_SIZE = 32
 # 4-vCPU box where the model is the bottleneck.
 LIBRI_NUM_WORKERS = 0
 
+# Preload all accepted windows into one (N, 306, 250) tensor up-front instead
+# of re-reading the H5 files on every __getitem__. This removes the disk-bound
+# per-step H5 reads that dominated Kaggle epoch time (hours -> minutes).
+# Memory guard: cache only if it fits under CACHE_MEMORY_LIMIT bytes, else
+# fall back to lazy sampling. Override with $CACHE_WINDOWS=0/1.
+LIBRI_CACHE_WINDOWS = int(os.environ.get("CACHE_WINDOWS", 1)) == 1
+LIBRI_CACHE_MEMORY_LIMIT = 6_500_000_000   # ~6.5 GB headroom on 16 GB boxes
+LIBRI_CLIP_BOUNDARY = 10.0                 # pnpl StandardizationMixin default
+
 # Validation holdout of the training split.
 VAL_FRACTION = 0.1
 LIBRI_SEED = 1337
@@ -351,24 +360,28 @@ class TrialAugmentation(nn.Module):
             return x
         b, c, t = x.shape
 
-        # --- time warp (per-trial factor, crop/pad back to T) ---
+        # --- time warp (per-trial factor, crop/pad back to T) ----------------
+        # Vectorized equivalent of per-sample resample + random view: one
+        # batched interpolate to a common grid, then a per-sample gather with
+        # clamped (replicated) boundaries.
         lo, hi = self.warp_range
-        pieces = []
-        for i in range(b):
-            s = float(torch.rand(1, device=x.device) * (hi - lo) + lo)
-            t2 = max(2, int(round(t * s)))
-            yi = F.interpolate(
-                x[i:i + 1], size=t2, mode="linear", align_corners=False
-            )
-            if t2 > t:                     # stretched -> random crop
-                start = int(torch.randint(0, t2 - t + 1, (1,), device=x.device))
-                yi = yi[..., start:start + t]
-            elif t2 < t:                   # compressed -> replicate-pad
-                pad = t - t2
-                left = int(torch.randint(0, pad + 1, (1,), device=x.device))
-                yi = F.pad(yi, (left, pad - left), mode="replicate")
-            pieces.append(yi)
-        x = torch.cat(pieces, dim=0)
+        scale = torch.rand(b, device=x.device) * (hi - lo) + lo
+        t2 = torch.clamp(torch.round(t * scale), min=2).long()
+        g = int(max(t2.max().item(), t))
+        if g != t:
+            x = F.interpolate(x, size=g, mode="linear", align_corners=False)
+        # random view start per sample: crop (stretched) or pad-left (compressed)
+        stretched = t2 > t
+        crop_start = torch.rand(b, device=x.device) * (t2 - t).clamp(min=0)
+        pad_left = torch.rand(b, device=x.device) * (t - t2).clamp(min=0)
+        off = torch.where(stretched, crop_start, -pad_left)           # (b,)
+        # output j -> source coordinate (off + j) * (T / t2): the stretched
+        # window sub-samples the t2 grid, the compressed view over-samples it.
+        rate = (t / t2.float())
+        pos = off[:, None] + torch.arange(t, device=x.device)[None, :] * \
+              rate[:, None]
+        idx = pos.floor().long().clamp(0, g - 1)[:, None, :]         # replicate edge
+        x = torch.gather(x, dim=2, index=idx.expand(b, c, t))
 
         # --- gaussian noise (z-scored units: 2% of signal std) ---
         if self.noise_std > 0:
@@ -424,6 +437,7 @@ class MEGCompetitionDataset(Dataset):
         word_to_primary: dict[str, int],
         word_to_moses: dict[str, int],
         ignore_index: int = -100,
+        preloaded: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.base = base
@@ -433,6 +447,11 @@ class MEGCompetitionDataset(Dataset):
         self.ignore_index = ignore_index
         self.n_channels = int(base.n_channels)     # 306 (MEGIN TRIUX Neo)
         self.n_times = int(base.n_times)           # 250 (1 s @ 250 Hz)
+        # Optional RAM cache: (N, C, T) pre-standardized windows. When present,
+        # __getitem__ stops touching the H5 files entirely (the Kaggle epoch
+        # time bottleneck). Kept as a plain attribute so DataLoader collation
+        # (num_workers=0 here) stays cheap.
+        self._preloaded = preloaded
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -442,14 +461,17 @@ class MEGCompetitionDataset(Dataset):
         word = normalize_word(self.base.samples[j][5])   # sample tuple (.., word, ..)
         y_primary = self.word_to_primary.get(word, self.ignore_index)
         y_moses = self.word_to_moses.get(word, self.ignore_index)
-        try:
-            x, _ = self.base[j]                  # (C, T) + unused task label
-        except Exception:
-            # A word onset near a recording's end may lack the 1-s tail (pnpl
-            # raises rather than pad). Mask the window out of BOTH losses so
-            # one stray run cannot kill a long job.
-            x = torch.zeros(self.n_channels, self.n_times, dtype=torch.float32)
-            y_primary = y_moses = self.ignore_index
+        if self._preloaded is not None:
+            x = self._preloaded[i]                  # (C, T); labels still derived
+        else:
+            try:
+                x, _ = self.base[j]                  # (C, T) + unused task label
+            except Exception:
+                # A word onset near a recording's end may lack the 1-s tail (pnpl
+                # raises rather than pad). Mask the window out of BOTH losses so
+                # one stray run cannot kill a long job.
+                x = torch.zeros(self.n_channels, self.n_times, dtype=torch.float32)
+                y_primary = y_moses = self.ignore_index
         return (
             x,
             torch.tensor(y_primary, dtype=torch.int64),
@@ -505,6 +527,51 @@ class PipelineMeta:
     n_rejected: int = 0
     mean: Optional[np.ndarray] = None      # per-channel train stats
     std: Optional[np.ndarray] = None
+    clip: Optional[float] = None           # pnpl clips standardized data to +/-clip
+
+
+# ----------------------------------------------------------------------------
+# LibriBrain100 memory cache + collate
+# ----------------------------------------------------------------------------
+def _preload_windows(base, indices: Sequence[int], n_channels: int, n_times: int):
+    """Materialise every accepted window as one (N, C, T) float32 tensor.
+
+    The one-time cost is a single pass over the pnpl dataset — exactly the disk
+    work the original code paid on EVERY __getitem__. Standardized on load by
+    pnpl's mixin (train-partition stats), so the cache holds train units.
+    """
+    cache = torch.empty(len(indices), n_channels, n_times, dtype=torch.float32)
+    for k, j in enumerate(indices):
+        try:
+            x, _ = base[j]
+        except Exception:
+            x = torch.zeros(n_channels, n_times, dtype=torch.float32)
+        cache[k] = torch.as_tensor(x, dtype=torch.float32).view(
+            n_channels, n_times
+        )
+        if (k + 1) % 5000 == 0:
+            print(f"[data_pipeline] preloaded {k + 1}/{len(indices)} windows ...")
+    return cache
+
+
+def _competition_collate(batch):
+    """Stack a batch, dropping fully-ignored (-100/-100) windows.
+
+    CrossEntropyLoss(ignore_index=-100) already ignores their loss, but keeping
+    them would feed zero rows into the batch-level TangentSpaceWhiten
+    covariance. Dropped rows shrink the batch marginally; never empty.
+    """
+    keep = [
+        (x, yp, ym) for (x, yp, ym) in batch
+        if not (int(yp) == -100 and int(ym) == -100)
+    ]
+    if not keep:
+        keep = [batch[0]]
+    return (
+        torch.stack([s[0] for s in keep]),
+        torch.stack([s[1] for s in keep]),
+        torch.stack([s[2] for s in keep]),
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -657,15 +724,15 @@ def build_mne_sample(
     return train_ds, adj, meta, loader
 
 
-def _make_splits(train_ds, val_ds, batch_size: int):
+def _make_splits(train_ds, val_ds, batch_size: int, collate_fn=None):
     """Train (shuffled) + val (sequential) loaders; val exposed on train_ds."""
     loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, num_workers=0,
-        drop_last=False, pin_memory=False,
+        drop_last=False, pin_memory=False, collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=0,
-        drop_last=False, pin_memory=False,
+        drop_last=False, pin_memory=False, collate_fn=collate_fn,
     )
     # Early-stopping handle used by train.py in both modes.
     train_ds.val_loader = val_loader
@@ -676,16 +743,21 @@ def _make_splits(train_ds, val_ds, batch_size: int):
 def build(
     data_path: Optional[Path] = None,
     batch_size: Optional[int] = None,
+    max_windows: Optional[int] = None,
 ) -> tuple:
     """Dispatcher: same (dataset, adj, meta, loader) tuple from either source.
 
     USE_REAL_DATA=False (local smoke) -> MNE loader.
     USE_REAL_DATA=True  (cloud)       -> LibriBrain100 loader (also attaches
     dataset.val_loader/val_dataset for early stopping).
+
+    max_windows caps the vocab-filtered window count (probe runs).
     """
     if USE_REAL_DATA:
         return build_libribrain100(
-            data_path=data_path, batch_size=batch_size or LIBRI_BATCH_SIZE
+            data_path=data_path,
+            batch_size=batch_size or LIBRI_BATCH_SIZE,
+            max_windows=max_windows,
         )
     return build_mne_sample(data_path=data_path, batch_size=batch_size or 8)
 
@@ -693,9 +765,29 @@ def build(
 # ----------------------------------------------------------------------------
 # LibriBrain100 (competition) pipeline
 # ----------------------------------------------------------------------------
+def _as_mask_stats(stats, n_channels: int) -> np.ndarray:
+    """pnpl channel stats -> (C,) float32; dead channels get variance 1.
+
+    pnpl's StandardizationMixin never leaves a channel at zero variance when
+    standardizing (it masks), so inverting the transform must reproduce that:
+    std of 0 would otherwise blow up at inference. Mirroring the MNE path's
+    ``sd = where(sd > 0, sd, 1.0)`` keeps both pipelines symmetric.
+    """
+    arr = np.asarray(stats, dtype=np.float64)
+    if arr.shape != (n_channels,):
+        raise ValueError(
+            f"channel stats shape {arr.shape} != expected ({n_channels},)"
+        )
+    out = arr.astype(np.float32).copy()
+    if np.any(arr <= 0):
+        out = np.where(arr > 0, out, 1.0)
+    return out
+
+
 def build_libribrain100(
     data_path: Optional[Path] = None,
     batch_size: int = LIBRI_BATCH_SIZE,
+    max_windows: Optional[int] = None,
 ) -> tuple:
     """LibriBrain100 (Deep Track, subject 0) -> the 4-tuple.
 
@@ -763,6 +855,10 @@ def build_libribrain100(
         )
     print(f"[data_pipeline] vocab filter: kept {len(keep)} / {len(ds.samples)} "
           f"windows (dropped {len(ds.samples) - len(keep)} out-of-vocab words)")
+    if max_windows is not None:
+        keep = keep[:max_windows]
+        print(f"[data_pipeline] probe limit: restricted to first "
+              f"{max_windows} windows")
 
     # Seeded 90/10 split on the index space; both wrapper datasets share the
     # one pnpl dataset (one standardization pass + file cache).
@@ -772,8 +868,36 @@ def build_libribrain100(
     train_idx = [keep[p] for p in perm[n_val:]]
     val_idx = [keep[p] for p in perm[:n_val]]
 
-    train_ds = MEGCompetitionDataset(ds, train_idx, word_to_primary, word_to_moses)
-    val_ds = MEGCompetitionDataset(ds, val_idx, word_to_primary, word_to_moses)
+    # RAM cache: preload the pre-standardized windows once, then never touch
+    # the H5 files again (the Kaggle epoch bottleneck). Only when it fits.
+    preloaded = None
+    if LIBRI_CACHE_WINDOWS:
+        n_cache = len(ds.samples)
+        n_bytes = n_cache * ds.n_channels * ds.n_times * 4
+        if n_bytes <= LIBRI_CACHE_MEMORY_LIMIT:
+            print(f"[data_pipeline] caching standardized windows ({n_cache} x "
+                  f"{ds.n_channels} x {ds.n_times} = {n_bytes / 2**30:.1f} GiB) ...")
+            cache_all = _preload_windows(ds, train_idx + val_idx,
+                                         ds.n_channels, ds.n_times)
+            preloaded = {
+                "train": cache_all[:len(train_idx)],
+                "val": cache_all[len(train_idx):],
+            }
+            del cache_all
+            gc.collect()
+        else:
+            print(f"[data_pipeline] CACHE DISABLED: {n_bytes / 2**30:.1f} GiB "
+                  f"> limit {LIBRI_CACHE_MEMORY_LIMIT / 2**30:.1f} GiB; falling "
+                  f"back to lazy H5 reads (slow on Kaggle CPU)")
+
+    train_ds = MEGCompetitionDataset(
+        ds, train_idx, word_to_primary, word_to_moses,
+        preloaded=preloaded["train"] if preloaded else None,
+    )
+    val_ds = MEGCompetitionDataset(
+        ds, val_idx, word_to_primary, word_to_moses,
+        preloaded=preloaded["val"] if preloaded else None,
+    )
 
     # GEOMETRIC sensor graph: the run's real channel names (from H5 metadata)
     # name-matched onto the canonical Neuromag 306 positions. Fall back to the
@@ -807,10 +931,14 @@ def build_libribrain100(
         sfreq=250.0,
         class_to_id=word_to_primary,
         n_rejected=0,                            # pnpl pre-filtered
-        mean=None, std=None,                     # pnpl z-scores on the fly
+        mean=_as_mask_stats(ds.channel_means, ds.n_channels),
+        std=_as_mask_stats(ds.channel_stds, ds.n_channels),
+        clip=LIBRI_CLIP_BOUNDARY,
     )
 
-    loader, val_loader = _make_splits(train_ds, val_ds, batch_size)
+    loader, val_loader = _make_splits(
+        train_ds, val_ds, batch_size, collate_fn=_competition_collate
+    )
     print(
         f"[data_pipeline] LibriBrain100 ready: train {len(train_ds)} windows, "
         f"val {len(val_ds)} windows, batch {batch_size}, "

@@ -19,6 +19,7 @@ single-flag edit in mimir_model.py.
 
 from __future__ import annotations
 
+import argparse
 import gc
 import os
 import resource
@@ -62,6 +63,7 @@ CLOUD_EPOCHS = 20
 CLOUD_PATIENCE = 3
 CLOUD_LR = 1e-3
 PROGRESS_EVERY = 200
+CLOUD_TRAIN_METRIC_BATCHES = 800   # plain Top-10 recall on this many train batches
 
 
 def peak_rss_mb() -> float:
@@ -169,41 +171,121 @@ def evaluate(model, loader, criterion, augment) -> float:
     return running / max(n, 1)
 
 
+@torch.no_grad()
+def top10_diagnostics(model, loader, num_classes: int, max_batches=None) -> dict:
+    """Primary-head Top-10 recall over a loader.
+
+    Returns both the plain top-10 recall and the balanced version (per-class
+    recall averaged over the classes present). The competition metric is the
+    balanced one; chance is ~1.0/50 for balanced and ~10/50 for plain recall
+    when a model emits the same top-10 list for every row. Vectorized per
+    batch, so it is cheap even on the full validation partition.
+    """
+    model.eval()
+    hits_total = n_total = 0
+    hits_by_class = torch.zeros(num_classes, dtype=torch.int64)
+    counts_by_class = torch.zeros(num_classes, dtype=torch.int64)
+    n_batches = 0
+    for x, y_p, y_m in loader:
+        logits_p, _ = model(x)
+        top = torch.topk(logits_p, 10, dim=-1).indices          # (B, 10)
+        yp = y_p
+        valid = yp != -100
+        if (n_valid := int(valid.sum().item())) > 0:
+            hit_any = (top == yp.unsqueeze(-1)).any(-1)         # (B,)
+            yv = yp[valid]
+            hv = hit_any[valid]
+            hits_by_class.index_add_(0, yv.long(), hv.long())
+            counts_by_class.index_add_(0, yv.long(), torch.ones_like(yv.long()))
+            hits_total += int(hv.sum().item())
+            n_total += n_valid
+        n_batches += 1
+        if max_batches is not None and n_batches >= max_batches:
+            break
+    model.train()
+
+    seen = counts_by_class > 0
+    per_class = (hits_by_class[seen].float() / counts_by_class[seen].clamp(min=1))
+    balanced = float(per_class.mean().item()) if int(seen.sum()) > 0 else 0.0
+    plain = hits_total / max(n_total, 1)
+    return {
+        "plain": plain,
+        "balanced": balanced,
+        "n_samples": n_total,
+        "n_classes_seen": int(seen.sum().item()),
+    }
+
+
 # ----------------------------------------------------------------------------
 # Cloud: multi-epoch training with early stopping + best-checkpoint saving
 # ----------------------------------------------------------------------------
-def run_cloud_training() -> None:
+def _cloud_value(cli_value, env_name: str, module_default):
+    """CLI flag > $ENV > module constant (Kaggle sets CLOUD_EPOCHS/PATIENCE)."""
+    if cli_value is not None:
+        return cli_value
+    if env_name in os.environ:
+        return type(module_default)(os.environ[env_name])
+    return module_default
+
+
+def run_cloud_training(opts=None) -> None:
+    epochs = _cloud_value(getattr(opts, "epochs", None), "CLOUD_EPOCHS", CLOUD_EPOCHS)
+    patience = _cloud_value(getattr(opts, "patience", None), "CLOUD_PATIENCE", CLOUD_PATIENCE)
+    max_windows = getattr(opts, "limit", None)
+    lr = _cloud_value(getattr(opts, "lr", None), "CLOUD_LR", CLOUD_LR)
+    batch = _cloud_value(getattr(opts, "batch", None), "CLOUD_BATCH_SIZE",
+                         CLOUD_BATCH_SIZE)
+    train_metric_batches = _cloud_value(
+        getattr(opts, "train_metric_batches", None), "CLOUD_TRAIN_METRIC_BATCHES",
+        CLOUD_TRAIN_METRIC_BATCHES)
+
     out_root = Path(__file__).resolve().parent / "checkpoints"
     out_root.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_root / "mimir_libri_best.pt"
 
-    dataset, adj, meta, loader = data_pipeline.build(batch_size=CLOUD_BATCH_SIZE)
+    dataset, adj, meta, loader = data_pipeline.build(
+        batch_size=batch, max_windows=max_windows,
+    )
     val_loader = dataset.val_loader
 
     model = make_model(meta, adj)
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    optimizer = torch.optim.Adam(model.parameters(), lr=CLOUD_LR, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    # Cosine annealing over the full epoch budget: warm at CLOUD_LR, decay to
+    # near zero at the last epoch (better than a constant LR when epoch count
+    # is small and the curve is dominated by a Zipfian prior fit).
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=lr / 20.0)
     augment = make_augment()
 
-    best_val, best_epoch, no_improve = float("inf"), 0, 0
-    print(f"[train] cloud run: epochs={CLOUD_EPOCHS} patience={CLOUD_PATIENCE} "
-          f"batch={CLOUD_BATCH_SIZE} train={len(dataset)} "
-          f"val={len(val_loader.dataset)}")
+    best_val, best_bal, best_epoch, no_improve = float("inf"), 0.0, 0, 0
+    print(f"[train] cloud run: epochs={epochs} patience={patience} "
+          f"batch={batch} train={len(dataset)} "
+          f"val={len(val_loader.dataset)} lr={lr} max_windows={max_windows}")
 
-    for epoch in range(1, CLOUD_EPOCHS + 1):
+    for epoch in range(1, epochs + 1):
         diag = train_one_epoch(model, loader, criterion, optimizer, augment, epoch)
         val_loss = evaluate(model, val_loader, criterion, augment)
+        vd = top10_diagnostics(model, val_loader, meta.n_primary_classes)
+        # Plain train-side recall on a bounded batch window (skip the full pass).
+        td = top10_diagnostics(model, loader, meta.n_primary_classes,
+                               max_batches=train_metric_batches)
+        cur_lr = float(optimizer.param_groups[0]["lr"])
+        scheduler.step()
 
         first5 = "/".join(
             f"{p:.3f}/{m:.3f}" for p, m in diag["batch_totals"][:MAX_PRINT_BATCHES]
         )
         print(f"epoch {epoch}: mean_primary={diag['mean_primary']:.4f} "
               f"mean_moses={diag['mean_moses']:.4f} val_loss={val_loss:.4f} "
+              f"train_Top10={td['plain']:.3f} val_Top10={vd['plain']:.3f} "
+              f"val_bal_Top10={vd['balanced']:.3f} lr={cur_lr:.2e} "
               f"(first-5 batches: {first5}) time={diag['wall_time']:.0f}s "
               f"RSS={peak_rss_mb():.0f} MB")
 
         if val_loss < best_val:
             best_val, best_epoch = val_loss, epoch
+            best_bal = vd["balanced"]
             no_improve = 0
             torch.save(
                 {
@@ -219,21 +301,25 @@ def run_cloud_training() -> None:
                         "use_whiten": USE_WHITEN,
                         "use_gcn": USE_GCN,
                         "use_tcn": USE_TCN,
-                        "lr": CLOUD_LR,
+                        "lr": lr,
+                        "batch": batch,
+                        "epochs": epochs,
                         "weight_decay": WEIGHT_DECAY,
                     },
                     "epoch": epoch,
                     "val_loss": val_loss,
+                    "val_bal_top10": best_bal,
                     "class_to_id": meta.class_to_id,
                     "class_names": meta.class_names,
                 },
                 ckpt_path,
             )
-            print(f"  * saved best checkpoint to {ckpt_path} (val_loss={val_loss:.4f})")
+            print(f"  * saved best checkpoint to {ckpt_path} (val_loss={val_loss:.4f}, "
+                  f"val_bal_Top10={best_bal:.3f})")
         else:
             no_improve += 1
-            if no_improve >= CLOUD_PATIENCE:
-                print(f"  early stopping after {CLOUD_PATIENCE} epochs without "
+            if no_improve >= patience:
+                print(f"  early stopping after {patience} epochs without "
                       f"improvement (best val_loss={best_val:.4f} @ epoch {best_epoch})")
                 break
 
@@ -242,7 +328,8 @@ def run_cloud_training() -> None:
             gc.collect()
 
     print("\n=== CLOUD SUMMARY ===")
-    print(f"best val_loss = {best_val:.4f} @ epoch {best_epoch} of {epoch} run")
+    print(f"best val_loss = {best_val:.4f} @ epoch {best_epoch} of {epoch} run, "
+          f"val_bal_Top10 = {best_bal:.3f} (chance = 1/50 = 0.020 per class)")
     print(f"checkpoint: {ckpt_path} (feed to submit.py)")
     print(f"peak RSS = {peak_rss_mb():.0f} MB "
           f"({'OK' if peak_rss_mb() < 20000 else 'TOO HIGH'})")
@@ -331,15 +418,34 @@ def run_smoke_training() -> None:
     print(f"total wall time = {time.time() - t0:.1f}s")
 
 
+def parse_args() -> argparse.Namespace:
+    """Cloud-run overrides (all optional; env vars/constants are the default).
+
+    The Kaggle notebook already exports CLOUD_EPOCHS/CLOUD_PATIENCE, so those
+    still win unless a CLI flag is passed.
+    """
+    p = argparse.ArgumentParser(description="MIMIR trainer (PNPL 2026 deep track)")
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--patience", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--batch", type=int, default=None)
+    p.add_argument("--limit", type=int, default=None,
+                   help="cap the vocab-filtered window count (probe runs)")
+    p.add_argument("--train-metric-batches", type=int, default=None,
+                   help="train-side Top-10 batches per epoch (default 800)")
+    return p.parse_args()
+
+
 def main() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     torch.set_num_threads(min(4, int(os.cpu_count() or 4)))
 
+    opts = parse_args()
     if data_pipeline.USE_REAL_DATA:
         print("[train] REAL-DATA mode (LibriBrain100) - cloud training "
               f"(gcn={USE_GCN}, tcn={USE_TCN})")
-        run_cloud_training()
+        run_cloud_training(opts)
     else:
         print(f"[train] MNE-SAMPLE mode - smoke test (gcn={USE_GCN}, tcn={USE_TCN})")
         run_smoke_training()

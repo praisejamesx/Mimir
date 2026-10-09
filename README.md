@@ -74,6 +74,22 @@ windows; the deep subject has far too many for a CPU session even with the RAM
 cache), `--epochs`/`--patience`, `--batch`, `--lr`, `--submission` (output
 path), `--no-submit`, and `--smoke` (local MNE wiring test, no pnpl).
 
+### Device support (CPU / GPU / anything)
+
+The whole pipeline is device-agnostic. Every entry point takes
+`--device auto|cpu|cuda` (default `auto` = CUDA if available, else CPU);
+`kaggle_run.py` also falls back to CPU automatically if a CUDA step fails.
+Checkpoints are saved as CPU tensors, so a run trained on a GPU loads anywhere:
+
+```bash
+python -u train.py  --epochs 20 --device cuda        # or cpu, or auto
+python -u submit.py --checkpoint checkpoints/mimir_libri_best.pt --device auto
+python -u kaggle_run.py --budget-hours 3 --device cuda
+```
+
+If you have a GPU, use it - you get 10-30x more effective training passes in
+the same wall-clock budget, i.e. a stronger model for the same time.
+
 ### Ablation runs
 
 Toggle the flags at the top of `mimir_model.py` (or pass `use_gcn=...` / `use_tcn=...` to the `Mimir` constructor) and re-run `train.py`; the flags are recorded in the checkpoint so `submit.py` reproduces the exact architecture. Typical arms: full model, no spatial graph (`use_gcn=False`), no temporal stack (`use_tcn=False`), no whitening.

@@ -45,7 +45,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--track", choices=["deep", "broad"], default="deep")
     p.add_argument("--no-sanity", action="store_true",
                    help="skip the bias-only (data-blind) CSV check")
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                   help="run device (auto = cuda if available)")
     return p.parse_args()
+
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
 
 
 def main() -> None:
@@ -58,10 +65,12 @@ def main() -> None:
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"checkpoint not found: {args.checkpoint}")
     output = args.output or Path(f"submission_{args.track}.csv")
+    device = resolve_device(args.device)
+    print(f"[submit] device = {device}")
 
     # ---- 1. Model ------------------------------------------------------------
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model = build_model_from_checkpoint(ckpt)
+    model = build_model_from_checkpoint(ckpt).to(device)
     meta = ckpt["meta"]
     print(f"[submit] checkpoint: epoch {ckpt.get('epoch')} "
           f"val_loss {ckpt.get('val_loss', float('nan')):.4f} "
@@ -82,6 +91,8 @@ def main() -> None:
     print(f"[submit] inference transform: (x - mean) / std "
           f"{'then clip +/-%.1f' % clip if clip else ''} "
           f"({len(mean)} channels)")
+    mean = mean.to(device)                                        # (C,)
+    std = std.to(device)                                          # (C,)
 
     # ---- 3. Holdout ----------------------------------------------------------
     from pnpl.competition import LibriBrainCompetitionHoldout, load_vocabulary
@@ -98,13 +109,13 @@ def main() -> None:
     moses_blocks: list[np.ndarray] = []
     with torch.no_grad():
         for batch, _ in holdout.iter_windows(batch_size=SUBMIT_BATCH_SIZE):
-            x = torch.from_numpy(batch).float()          # (B, 306, 250) SI units
+            x = torch.from_numpy(batch).float().to(device)   # (B, 306, 250) SI
             x = (x - mean[None, :, None]) / std[None, :, None]
             if clip is not None:
                 x = x.clamp(-clip, clip)                 # pnpl training clip
             logits_p, logits_m = model(x)                # (B, 50), (B, 50)
-            primary_blocks.append(torch.softmax(logits_p, dim=1).numpy())
-            moses_blocks.append(torch.softmax(logits_m, dim=1).numpy())
+            primary_blocks.append(torch.softmax(logits_p, dim=1).cpu().numpy())
+            moses_blocks.append(torch.softmax(logits_m, dim=1).cpu().numpy())
 
     primary_probs = np.concatenate(primary_blocks, axis=0)
     moses_probs = np.concatenate(moses_blocks, axis=0)

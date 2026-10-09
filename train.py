@@ -65,6 +65,17 @@ CLOUD_LR = 1e-3
 PROGRESS_EVERY = 200
 CLOUD_TRAIN_METRIC_BATCHES = 300   # plain Top-10 recall on this many train batches
 
+# Resolved at main() time from --device (auto|cpu|cuda); everything (model,
+# batches, labels, augmentation) moves here. The code stays device-agnostic:
+# the same commands run on CPU or GPU.
+DEVICE = torch.device("cpu")
+
+
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
 
 def peak_rss_mb() -> float:
     """Peak resident set size of this process, in MB."""
@@ -105,6 +116,7 @@ def train_one_epoch(model, loader, criterion, optimizer, augment, epoch: int) ->
 
     for i, (x, y_p, y_m) in enumerate(loader):
         t_b = time.time()
+        x, y_p, y_m = x.to(DEVICE), y_p.to(DEVICE), y_m.to(DEVICE)
         if AUGMENT:
             x = augment(x)
 
@@ -163,6 +175,7 @@ def evaluate(model, loader, criterion, augment) -> float:
     running, n = 0.0, 0
     with torch.no_grad():
         for x, y_p, y_m in loader:
+            x, y_p, y_m = x.to(DEVICE), y_p.to(DEVICE), y_m.to(DEVICE)
             logits_p, logits_m = model(x)
             running += (criterion(logits_p, y_p) + criterion(logits_m, y_m)).item()
             n += 1
@@ -187,6 +200,7 @@ def top10_diagnostics(model, loader, num_classes: int, max_batches=None) -> dict
     counts_by_class = torch.zeros(num_classes, dtype=torch.int64)
     n_batches = 0
     for x, y_p, y_m in loader:
+        x, y_p = x.to(DEVICE), y_p.to(DEVICE)
         logits_p, _ = model(x)
         top = torch.topk(logits_p, 10, dim=-1).indices          # (B, 10)
         yp = y_p
@@ -248,7 +262,7 @@ def run_cloud_training(opts=None) -> None:
     )
     val_loader = dataset.val_loader
 
-    model = make_model(meta, adj)
+    model = make_model(meta, adj).to(DEVICE)
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     # Cosine annealing over the full epoch budget: warm at CLOUD_LR, decay to
@@ -289,7 +303,11 @@ def run_cloud_training(opts=None) -> None:
             no_improve = 0
             torch.save(
                 {
-                    "model_state": model.state_dict(),
+                    # Always persist CPU tensors so the checkpoint loads on any
+                    # machine, regardless of the device it was trained on.
+                    "model_state": {
+                        k: v.detach().cpu() for k, v in model.state_dict().items()
+                    },
                     "optimizer_state": optimizer.state_dict(),
                     "adj": adj,
                     "meta": asdict(meta),
@@ -369,7 +387,7 @@ def run_smoke_training() -> None:
     gc.collect()
 
     # ---- 3. Model -----------------------------------------------------------
-    model = make_model(meta, adj)
+    model = make_model(meta, adj).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     print(f"[train] RSS after setup = {peak_rss_mb():.0f} MB")
@@ -433,6 +451,8 @@ def parse_args() -> argparse.Namespace:
                    help="cap the vocab-filtered window count (probe runs)")
     p.add_argument("--train-metric-batches", type=int, default=None,
                    help="train-side Top-10 batches per epoch (default 800)")
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                   help="run device (auto = cuda if available)")
     return p.parse_args()
 
 
@@ -442,6 +462,10 @@ def main() -> None:
     torch.set_num_threads(min(4, int(os.cpu_count() or 4)))
 
     opts = parse_args()
+    global DEVICE
+    DEVICE = resolve_device(opts.device)
+    print(f"[train] device = {DEVICE} "
+          f"(cuda available={torch.cuda.is_available()})")
     if data_pipeline.USE_REAL_DATA:
         print("[train] REAL-DATA mode (LibriBrain100) - cloud training "
               f"(gcn={USE_GCN}, tcn={USE_TCN})")

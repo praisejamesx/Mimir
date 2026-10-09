@@ -58,6 +58,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--measure-windows", type=int, default=8192)
     p.add_argument("--measure-batches", type=int, default=64)
     p.add_argument("--train-metric-batches", type=int, default=250)
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                   help="run device (auto = cuda if available); falls back to "
+                        "cpu if a CUDA step fails")
     p.add_argument("--submission", type=str, default="submission_deep.csv")
     p.add_argument("--no-submit", action="store_true")
     p.add_argument("--smoke", action="store_true",
@@ -70,12 +73,12 @@ def parse_args() -> argparse.Namespace:
 # ----------------------------------------------------------------------------
 # Measurement
 # ----------------------------------------------------------------------------
-def measure_sec_per_window(args) -> float:
-    """Feeze a (train-augmented, backward) step rate from a capped build."""
+def measure_sec_per_window(args, device: torch.device) -> float:
+    """Freeze a (train-augmented, backward) step rate from a capped build."""
     ds, adj, meta, loader = data_pipeline.build(
         batch_size=args.batch, max_windows=args.measure_windows,
     )
-    model = train_mod.make_model(meta, adj)
+    model = train_mod.make_model(meta, adj).to(device)
     crit = nn.CrossEntropyLoss(ignore_index=-100)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr or train_mod.CLOUD_LR,
                            weight_decay=train_mod.WEIGHT_DECAY)
@@ -92,6 +95,7 @@ def measure_sec_per_window(args) -> float:
         except StopIteration:
             it = iter(loader)
             continue
+        x, y_p, y_m = x.to(device), y_p.to(device), y_m.to(device)
         x = aug(x)
         logits_p, logits_m = model(x)
         loss = crit(logits_p, y_p) + crit(logits_m, y_m)
@@ -108,7 +112,7 @@ def measure_sec_per_window(args) -> float:
         gc.collect()
     sec = elapsed / max(windows_seen, 1)
     print(f"[kaggle_run] measured {windows_seen} windows in {elapsed:.1f}s -> "
-          f"{sec * 1000:.1f} ms/window (train step, aug+backward)")
+          f"{sec * 1000:.1f} ms/window (train step, aug+backward, device {device})")
     return sec
 
 
@@ -191,6 +195,7 @@ def run_training(plan: dict, args) -> None:
         "--batch", str(args.batch),
         "--limit", str(plan["n_use"]),
         "--train-metric-batches", str(args.train_metric_batches),
+        "--device", args.device,
     ]
     if args.lr is not None:
         sys.argv += ["--lr", str(args.lr)]
@@ -204,6 +209,7 @@ def run_submission(args) -> None:
         "--checkpoint", str(ckpt),
         "--track", "deep",
         "--output", args.submission,
+        "--device", args.device,
     ]
     try:
         submit.main()
@@ -231,7 +237,20 @@ def main() -> None:
           f"budget={args.budget_hours}h  cache-limit="
           f"{data_pipeline.LIBRI_CACHE_MEMORY_LIMIT / 2**30:.1f}GiB")
 
-    sec = measure_sec_per_window(args)
+    device = train_mod.resolve_device(args.device)
+    print(f"[kaggle_run] device = {device} "
+          f"(cuda available={torch.cuda.is_available()})")
+    try:
+        sec = measure_sec_per_window(args, device)
+    except RuntimeError as exc:
+        print(f"[kaggle_run] measurement failed on {device}: {exc}")
+        if device.type == "cuda":
+            print("[kaggle_run] falling back to cpu; the whole run will use cpu")
+            device = torch.device("cpu")
+            args.device = "cpu"
+            sec = measure_sec_per_window(args, device)
+        else:
+            raise
     n_full, _info = count_available_windows(args)
     print(f"[kaggle_run] full vocab-filtered windows available: {n_full}")
 

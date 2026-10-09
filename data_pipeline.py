@@ -88,7 +88,8 @@ LIBRI_NUM_WORKERS = 0
 # Memory guard: cache only if it fits under CACHE_MEMORY_LIMIT bytes, else
 # fall back to lazy sampling. Override with $CACHE_WINDOWS=0/1.
 LIBRI_CACHE_WINDOWS = int(os.environ.get("CACHE_WINDOWS", 1)) == 1
-LIBRI_CACHE_MEMORY_LIMIT = 6_500_000_000   # ~6.5 GB headroom on 16 GB boxes
+LIBRI_CACHE_MEMORY_LIMIT = int(os.environ.get(
+    "LIBRI_CACHE_MEMORY_LIMIT_BYTES", 6_500_000_000))
 LIBRI_CLIP_BOUNDARY = 10.0                 # pnpl StandardizationMixin default
 
 # Validation holdout of the training split.
@@ -869,10 +870,13 @@ def build_libribrain100(
     val_idx = [keep[p] for p in perm[:n_val]]
 
     # RAM cache: preload the pre-standardized windows once, then never touch
-    # the H5 files again (the Kaggle epoch bottleneck). Only when it fits.
+    # the H5 files again (the Kaggle epoch bottleneck). Guard is based on the
+    # windows this run ACTUALLY keeps (post vocab-filter + --limit), never the
+    # raw sample count, so a capped run caches even when the full subject
+    # would not fit.
     preloaded = None
     if LIBRI_CACHE_WINDOWS:
-        n_cache = len(ds.samples)
+        n_cache = len(train_idx) + len(val_idx)
         n_bytes = n_cache * ds.n_channels * ds.n_times * 4
         if n_bytes <= LIBRI_CACHE_MEMORY_LIMIT:
             print(f"[data_pipeline] caching standardized windows ({n_cache} x "

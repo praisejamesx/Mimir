@@ -58,6 +58,22 @@ Top-10 of 0.200, exactly chance).
 > `val_bal_Top10` follows, the model is genuinely decoding; extend epochs. If both stay
 > ~0.2 the run is still fitting the word-frequency prior - keep training.
 
+### Kaggle one-shot (recommended)
+
+`kaggle_run.py` measures the live per-window cost once, then picks the largest
+window count + epoch count that fit a wall-clock budget and drives the whole
+pipeline (train -> exact-transform inference -> diversity-guarded CSV):
+
+```bash
+python -u kaggle_run.py --budget-hours 5 --limit 25000 --epochs 12 --patience 4
+```
+
+It is what the notebook's single "master cell" calls. Flags: `--budget-hours`
+(total wall-clock, leaves ~0.4 h headroom), `--limit` (hard cap on training
+windows; the deep subject has far too many for a CPU session even with the RAM
+cache), `--epochs`/`--patience`, `--batch`, `--lr`, `--submission` (output
+path), `--no-submit`, and `--smoke` (local MNE wiring test, no pnpl).
+
 ### Ablation runs
 
 Toggle the flags at the top of `mimir_model.py` (or pass `use_gcn=...` / `use_tcn=...` to the `Mimir` constructor) and re-run `train.py`; the flags are recorded in the checkpoint so `submit.py` reproduces the exact architecture. Typical arms: full model, no spatial graph (`use_gcn=False`), no temporal stack (`use_tcn=False`), no whitening.

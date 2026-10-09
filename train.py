@@ -63,7 +63,7 @@ CLOUD_EPOCHS = 20
 CLOUD_PATIENCE = 3
 CLOUD_LR = 1e-3
 PROGRESS_EVERY = 200
-CLOUD_TRAIN_METRIC_BATCHES = 800   # plain Top-10 recall on this many train batches
+CLOUD_TRAIN_METRIC_BATCHES = 300   # plain Top-10 recall on this many train batches
 
 
 def peak_rss_mb() -> float:

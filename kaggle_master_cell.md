@@ -93,9 +93,9 @@ print("[master cell] submit it on the competition page.")
 
 CPU-only / extra-spare-time variants (change one line, everything else the same):
 
-- `--budget-hours 3.2` -> `--budget-hours 11` (a full CPU session can train far
+- `--budget-hours 6.5` -> `--budget-hours 11` (a full CPU session can train far
   more, but stays under the 12 h notebook cap).
-- `--limit 80000` / `--epochs 25` are only ceilings; the auto-sizer picks the
+- `--limit 80000` / `--epochs 20` are only ceilings; the auto-sizer picks the
   largest (windows, epochs) that fit whatever device and budget you gave it.
 - Lower `LIBRI_CACHE_MEMORY_LIMIT_BYTES` to `14000000000` (14 GiB, the default)
   if your notebook is short on RAM.

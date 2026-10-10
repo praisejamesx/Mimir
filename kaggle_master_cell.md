@@ -78,8 +78,8 @@ os.environ["CACHE_WINDOWS"] = "1"
 os.environ["LIBRI_CACHE_MEMORY_LIMIT_BYTES"] = "24000000000"   # 24 GiB cache
 rc = subprocess.run(
     [sys.executable, "-u", "kaggle_run.py",
-     "--budget-hours", "3.2", "--limit", "80000",
-     "--epochs", "25", "--patience", "5",
+     "--budget-hours", "6.5", "--limit", "80000",
+     "--epochs", "20", "--patience", "5",
      "--submission", "/kaggle/working/submission_deep.csv"],
     cwd=REPO, check=False,
 ).returncode

@@ -110,13 +110,14 @@ def train_one_epoch(model, loader, criterion, optimizer, augment, epoch: int) ->
     """One full training pass; returns diagnostics for the epoch summary."""
     model.train()
     augment.train()
+    dev = next(model.parameters()).device
     running_p, running_m, n_batches = 0.0, 0.0, 0
     batch_totals: list[tuple[float, float]] = []
     epoch_t0 = time.time()
 
     for i, (x, y_p, y_m) in enumerate(loader):
         t_b = time.time()
-        x, y_p, y_m = x.to(DEVICE), y_p.to(DEVICE), y_m.to(DEVICE)
+        x, y_p, y_m = x.to(dev), y_p.to(dev), y_m.to(dev)
         if AUGMENT:
             x = augment(x)
 
@@ -172,10 +173,11 @@ def evaluate(model, loader, criterion, augment) -> float:
     """
     model.eval()
     augment.eval()
+    dev = next(model.parameters()).device
     running, n = 0.0, 0
     with torch.no_grad():
         for x, y_p, y_m in loader:
-            x, y_p, y_m = x.to(DEVICE), y_p.to(DEVICE), y_m.to(DEVICE)
+            x, y_p, y_m = x.to(dev), y_p.to(dev), y_m.to(dev)
             logits_p, logits_m = model(x)
             running += (criterion(logits_p, y_p) + criterion(logits_m, y_m)).item()
             n += 1
@@ -195,12 +197,15 @@ def top10_diagnostics(model, loader, num_classes: int, max_batches=None) -> dict
     batch, so it is cheap even on the full validation partition.
     """
     model.eval()
+    # Derive the device from the model itself (not the module global) so the
+    # metric is correct wherever the model lives - CPU, CUDA, whatever.
+    dev = next(model.parameters()).device
     hits_total = n_total = 0
-    hits_by_class = torch.zeros(num_classes, dtype=torch.int64)
-    counts_by_class = torch.zeros(num_classes, dtype=torch.int64)
+    hits_by_class = torch.zeros(num_classes, dtype=torch.int64, device=dev)
+    counts_by_class = torch.zeros(num_classes, dtype=torch.int64, device=dev)
     n_batches = 0
     for x, y_p, y_m in loader:
-        x, y_p = x.to(DEVICE), y_p.to(DEVICE)
+        x, y_p = x.to(dev), y_p.to(dev)
         logits_p, _ = model(x)
         top = torch.topk(logits_p, 10, dim=-1).indices          # (B, 10)
         yp = y_p
@@ -280,10 +285,19 @@ def run_cloud_training(opts=None) -> None:
     for epoch in range(1, epochs + 1):
         diag = train_one_epoch(model, loader, criterion, optimizer, augment, epoch)
         val_loss = evaluate(model, val_loader, criterion, augment)
-        vd = top10_diagnostics(model, val_loader, meta.n_primary_classes)
-        # Plain train-side recall on a bounded batch window (skip the full pass).
-        td = top10_diagnostics(model, loader, meta.n_primary_classes,
-                               max_batches=train_metric_batches)
+        # Compute metrics defensively; any metric failure should not kill the run
+        # (it would waste an epoch before saving a checkpoint).
+        try:
+            vd = top10_diagnostics(model, val_loader, meta.n_primary_classes)
+            td = top10_diagnostics(
+                model, loader, meta.n_primary_classes,
+                max_batches=train_metric_batches)
+        except Exception as exc:
+            print(f"  [warning] metric computation failed ({exc}); metrics set to 0.0")
+            vd = {"plain": float("nan"), "balanced": 0.0, "n_samples": 0,
+                  "n_classes_seen": 0}
+            td = {"plain": float("nan"), "balanced": 0.0, "n_samples": 0,
+                  "n_classes_seen": 0}
         cur_lr = float(optimizer.param_groups[0]["lr"])
         scheduler.step()
 

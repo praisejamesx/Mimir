@@ -11,6 +11,8 @@ checkpoints/
 # repo's product.
 baseline/
 
+docs/
+
 # Competition artifacts.
 *.pt
 submission_*.csv

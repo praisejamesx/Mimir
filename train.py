@@ -118,3 +118,190 @@ def resolve_device(name: str) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
 
+
+def make_model(meta, adj) -> Mimir:
+    from mimir_model import Mimir
+    return Mimir(
+        n_channels=meta.n_channels,
+        n_primary_classes=meta.n_primary_classes,
+        n_moses_classes=meta.n_moses_classes,
+        adj=adj,
+        d_model=D_MODEL,
+        tcn_layers=TCN_LAYERS,
+        dropout=DROPOUT,
+        causal=CAUSAL,
+        use_whiten=USE_WHITEN,
+        use_gcn=True,
+        use_tcn=True,
+    )
+
+
+def make_augment() -> data_pipeline.TrialAugmentation:
+    from data_pipeline import TrialAugmentation
+    return TrialAugmentation(
+        p_channel=AUGMENT_P_CHANNEL,
+        warp_range=AUGMENT_WARP,
+        noise_std=AUGMENT_NOISE,
+    )
+
+
+def train_one_epoch(model, loader, criterion, optimizer, augment, epoch: int) -> dict:
+    model.train()
+    augment.train()
+    dev = next(model.parameters()).device
+    running_p, running_m, n_batches = 0.0, 0.0, 0
+    batch_totals: list[tuple[float, float]] = []
+    epoch_t0 = time.time()
+
+    for i, (x, y_p, y_m) in enumerate(loader):
+        t_b = time.time()
+        x, y_p, y_m = x.to(dev), y_p.to(dev), y_m.to(dev)
+        if AUGMENT:
+            x = augment(x)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits_p, logits_m = model(x)
+
+        loss_primary = criterion(logits_p, y_p)
+        loss_moses = criterion(logits_m, y_m)
+        loss = loss_primary + loss_moses
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1e9)
+        optimizer.step()
+
+        running_p += loss_primary.item()
+        running_m += loss_moses.item()
+        batch_totals.append((loss_primary.item(), loss_moses.item()))
+        n_batches += 1
+
+        if i < MAX_PRINT_BATCHES:
+            assert torch.isfinite(loss), "total loss is not finite"
+            assert torch.isfinite(grad_norm) and grad_norm > 0, "no gradient flow"
+            print(f"  batch {i}: loss_primary={loss_primary.item():.4f}  \\\\ "
+                  f"loss_moses={loss_moses.item():.4f}  total={loss.item():.4f}  \\\\ "
+                  f"grad_norm={float(grad_norm):.4e}  time={time.time() - t_b:.2f}s")
+        elif (i + 1) % PROGRESS_EVERY == 0:
+            print(f"  epoch {epoch} batch {i + 1}: "
+                  f"loss_primary={loss_primary.item():.4f} "
+                  f"loss_moses={loss_moses.item():.4f} "
+                  f"total={loss.item():.4f}")
+
+        del x, y_p, y_m, logits_p, logits_m, loss_primary, loss_moses, loss
+        if (i + 1) % 10 == 0:
+            gc.collect()
+
+    return {
+        "mean_primary": running_p / max(n_batches, 1),
+        "mean_moses": running_m / max(n_batches, 1),
+        "n_batches": n_batches,
+        "wall_time": time.time() - epoch_t0,
+        "sec_per_batch": (time.time() - epoch_t0) / max(n_batches, 1),
+        "batch_totals": batch_totals,
+    }
+
+
+def evaluate(model, loader, criterion, augment, epoch: int = None) -> dict:
+    model.eval()
+    augment.eval()
+    with torch.no_grad():
+        dev = next(model.parameters()).device
+        running_p, running_m, n_batches = 0.0, 0.0, 0
+        epoch_t0 = time.time()
+
+        for i, (x, y_p, y_m) in enumerate(loader):
+            x, y_p, y_m = x.to(dev), y_p.to(dev), y_m.to(dev)
+            if AUGMENT and augment.training:
+                x = augment(x)
+
+            logits_p, logits_m = model(x)
+            loss_primary = criterion(logits_p, y_p)
+            loss_moses = criterion(logits_m, y_m)
+            loss = loss_primary + loss_moses
+
+            running_p += loss_primary.item()
+            running_m += loss_moses.item()
+            n_batches += 1
+
+            if i < 3:
+                print(f"  eval batch {i}: loss_primary={loss_primary.item():.4f}  "
+                      f"loss_moses={loss_moses.item():.4f}  total={loss.item():.4f}")
+
+            del x, y_p, y_m, logits_p, logits_m, loss_primary, loss_moses, loss
+
+    return {
+        "mean_primary": running_p / max(n_batches, 1),
+        "mean_moses": running_m / max(n_batches, 1),
+        "n_batches": n_batches,
+        "wall_time": time.time() - epoch_t0,
+        "sec_per_batch": (time.time() - epoch_t0) / max(n_batches, 1),
+    }
+
+
+def top10_diagnostics(model, loader, epoch: int = None) -> dict:
+    """Top-10 per-class accuracy (used for Kaggle competition metrics).
+
+    Keys: acc_by_class (list of 10 floats, per-word top-10 accuracy),
+           hits_by_class / counts_by_class (accumulator tensors, same device as model),
+           overall_top10 (float).
+    """
+    model.eval()
+    dev = next(model.parameters()).device
+
+    n_classes = 10  # top-10 accuracy over the 50-word vocabulary
+    hits = torch.zeros(n_classes, dtype=torch.float64, device=dev)
+    counts = torch.zeros(n_classes, dtype=torch.float64, device=dev)
+
+    # We need the word indices to know which of the 10 top classes each sample belongs to.
+    # The dataset provides y_p (primary) and y_m (moses) as word indices in [0, 49].
+    # Top-10 per-class means: for each of the 10 classes (0..9), compute fraction of
+    # samples whose true word index falls in that class and was in the top-10 prediction.
+
+    with torch.no_grad():
+        for x, y_p, y_m in loader:
+            x = x.to(dev)
+            logits_p, _ = model(x)  # logits_p: (B, n_primary_classes=50)
+
+            # Top-10 predictions
+            topk_vals, topk_idx = torch.topk(logits_p, k=10, dim=1)  # (B, 10)
+
+            # For each of the 10 top positions, check if the true word is in top-10
+            # topk_idx: (B, 10), y_p: (B,) with values in [0, 49]
+            # We want per-class accuracy over 10 classes (0..9), so bin y_p into 10 bins
+            class_idx = y_p.clamp(max=9).long()  # bin [0,49] into 10 classes
+
+            # Expand class_idx to (B, 10) to match topk_idx
+            class_idx_exp = class_idx.view(-1, 1).expand(-1, 10)  # (B, 10)
+
+            # Hit: true class matches one of the top-10 positions
+            # Actually, we check if the true word index appears in topk_idx
+            true_in_topk = (topk_idx == y_p.unsqueeze(1)).any(dim=1)  # (B,) bool
+
+            # Now accumulate per-class: for each sample whose true word is in class c,
+            # check if it was in top-10
+            for c in range(n_classes):
+                mask = (class_idx == c) & true_in_topk
+                hits[c] += mask.sum().float()
+                counts[c] += mask.sum().float()  # same mask: only count if true word in this class AND in top-10
+
+    # Compute overall top-10 accuracy and per-class
+    total_hits = hits.sum().item()
+    total_counts = counts.sum().item()
+    overall_top10 = total_hits / total_counts if total_counts > 0 else 0.0
+
+    acc_by_class = [(h / max(c, 1)).item() for h, c in zip(hits, counts)]
+
+    result = {
+        "acc_by_class": acc_by_class,  # list of 10 floats
+        "overall_top10": overall_top10,
+    }
+
+    # Also include the raw accumulator info (as CPU tensors for logging)
+    result["hits_by_class"] = hits.cpu()
+    result["counts_by_class"] = counts.cpu()
+
+    if epoch is not None:
+        print(f"  epoch {epoch} top-10 diagnostics: acc_by_class={acc_by_class}  "
+              f"overall_top10={overall_top10:.4f}  total={total_counts}")
+
+    return result
+

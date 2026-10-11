@@ -52,11 +52,6 @@ DEVICE = torch.device("cpu")
 # ----------------------------------------------------------------------------
 # Class weighting & focal loss
 # ----------------------------------------------------------------------------
-def peak_rss_mb() -> float:
-    """Peak resident set size of this process, in MB."""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
-
-
 def compute_class_weights(dataset, num_classes: int, ignore_index: int = -100) -> torch.Tensor:
     """Compute sqrt-inverse-frequency class weights, clamped to [0.5, 5.0].
 

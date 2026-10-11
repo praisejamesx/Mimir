@@ -112,3 +112,9 @@ def get_scheduler(optimizer, epochs: int, warmup_epochs: int = 5, lr: float = 1e
     return torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup, cosine],
         milestones=[warmup_epochs])
+
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+

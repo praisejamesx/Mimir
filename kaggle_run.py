@@ -68,6 +68,21 @@ def parse_args() -> argparse.Namespace:
                    help="local wiring test on the MNE sample path (no pnpl)")
     p.add_argument("--keep", action="store_true",
                    help="do not delete the introspect build's dataset objects")
+    # --- model / objective (threaded straight through to train.py) -----------
+    p.add_argument("--loss", choices=["focal", "ce"], default=train_mod.LOSS)
+    p.add_argument("--gamma", type=float, default=train_mod.GAMMA)
+    p.add_argument("--class-weights", choices=["sqrt-inv", "none"],
+                   default=train_mod.CLASS_WEIGHTS)
+    p.add_argument("--pool", choices=["mean", "attn"], default=train_mod.POOL)
+    p.add_argument("--d-model", type=int, default=train_mod.D_MODEL)
+    p.add_argument("--tcn-layers", type=int, default=train_mod.TCN_LAYERS)
+    p.add_argument("--dropout", type=float, default=train_mod.DROPOUT)
+    p.add_argument("--accum-steps", type=int, default=train_mod.ACCUM_STEPS)
+    p.add_argument("--clip-grad", type=float, default=train_mod.CLIP_GRAD)
+    p.add_argument("--no-balanced-sampling", dest="balanced_sampling",
+                   action="store_false", default=train_mod.BALANCED_SAMPLING)
+    p.add_argument("--overfit", type=int, default=0,
+                   help="diagnostic: train on N fixed windows only, then exit")
     return p.parse_args()
 
 
@@ -197,7 +212,18 @@ def run_training(plan: dict, args) -> None:
         "--limit", str(plan["n_use"]),
         "--train-metric-batches", str(args.train_metric_batches),
         "--device", args.device,
+        "--loss", args.loss,
+        "--gamma", str(args.gamma),
+        "--class-weights", args.class_weights,
+        "--pool", args.pool,
+        "--d-model", str(args.d_model),
+        "--tcn-layers", str(args.tcn_layers),
+        "--dropout", str(args.dropout),
+        "--accum-steps", str(args.accum_steps),
+        "--clip-grad", str(args.clip_grad),
     ]
+    if not args.balanced_sampling:
+        sys.argv += ["--no-balanced-sampling"]
     if args.lr is not None:
         sys.argv += ["--lr", str(args.lr)]
     train_mod.main()
@@ -241,6 +267,23 @@ def main() -> None:
     device = train_mod.resolve_device(args.device)
     print(f"[kaggle_run] device = {device} "
           f"(cuda available={torch.cuda.is_available()})")
+    if device.type == "cpu":
+        print("[kaggle_run] WARNING: running on CPU (no CUDA). Enable the "
+              "notebook's GPU P100 accelerator for ~10x faster training.")
+
+    # Overfit diagnostic: no sizing, no measurement, no submission.
+    if args.overfit > 0:
+        print(f"[kaggle_run] OVERFIT diagnostic: {args.overfit} windows")
+        sys.argv = [
+            "train.py", "--overfit", str(args.overfit), "--epochs", "60",
+            "--batch", str(min(args.batch, args.overfit)),
+            "--device", args.device, "--pool", args.pool,
+            "--d-model", str(args.d_model), "--tcn-layers", str(args.tcn_layers),
+            "--dropout", str(args.dropout),
+        ]
+        train_mod.main()
+        return
+
     try:
         sec = measure_sec_per_window(args, device)
     except RuntimeError as exc:
@@ -252,8 +295,16 @@ def main() -> None:
             sec = measure_sec_per_window(args, device)
         else:
             raise
-    n_full, _info = count_available_windows(args)
-    print(f"[kaggle_run] full vocab-filtered windows available: {n_full}")
+    # The full count build is a second ~15-min dataset construction. When the
+    # user already capped windows (--limit), that cap is an upper bound on
+    # n_use, so it is safe to skip the count entirely.
+    if args.limit is not None:
+        n_full = args.limit
+        print(f"[kaggle_run] --limit set; skipping full window count "
+              f"(assuming n_full={n_full})")
+    else:
+        n_full, _info = count_available_windows(args)
+        print(f"[kaggle_run] full vocab-filtered windows available: {n_full}")
 
     plan = solve_plan(args, sec, n_full)
     print("\n[kaggle_run] PLAN")

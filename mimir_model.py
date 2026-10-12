@@ -18,8 +18,9 @@ Blocks
 3. TemporalStack: dilated residual convolutions; dilation powers of two give
    an exponential receptive field (RF = 255 samples at 250 Hz) at linear
    depth, covering the full 1 s word window.
-4. Two ClassifierHeads: mean-pool over time + linear (time-translation
-   invariant; parameter count independent of window length).
+4. Two ClassifierHeads: pool over time (learnable attention by default, or
+   mean) + linear. Both are time-translation flexible and parameter count
+   independent of window length.
 
 Ablation switches: use_gcn / use_tcn / use_whiten constructor flags. The
 module-level USE_GCN / USE_TCN constants below are the single place to flip
@@ -175,22 +176,45 @@ class TemporalStack(nn.Module):
 
 
 class ClassifierHead(nn.Module):
-    """Mean-pool over time, then a linear readout.
+    """Pool over time, then a linear readout.
 
-    Mean-pooling gives time-translation invariance (which word was spoken does
-    not depend on exactly when in the window) and keeps parameter count
-    independent of T, so the same head serves any window length. Two of these
+    Two pooling modes (``pool``):
+      * ``"mean"``: adaptive average pool over time (time-translation
+        invariant, parameter count independent of T).
+      * ``"attn"``: a learnable scalar attention over time (softmax-weighted
+        sum), followed by a LayerNorm. Word identity is carried by the temporal
+        *trajectory* of the evoked response, not its average, so a learned
+        temporal weighting preserves far more discriminative signal than the
+        mean while staying translation-flexible and parameter-light. This is
+        the readout fix for the "mean pooling -> balanced Top-10 = chance"
+        collapse (see docs/00_STRATEGY_MASTER.md, killer #2).
+
+    Both modes keep parameter count independent of the window length T, so the
+    same head serves any window length and is checkpoint-portable. Two of these
     sit on the shared backbone - one per competition vocabulary.
     """
 
-    def __init__(self, channels: int, n_classes: int):
+    def __init__(self, channels: int, n_classes: int, pool: str = "mean"):
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        assert pool in ("mean", "attn"), f"unknown pool: {pool}"
+        self.pool_type = pool
+        if pool == "mean":
+            self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        else:
+            self.score = nn.Linear(channels, 1)   # (B, T, D) -> (B, T, 1)
+            self.norm = nn.LayerNorm(channels)
         self.fc = nn.Linear(channels, n_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.pool(x).squeeze(-1)          # (B, D)
-        return self.fc(h)                     # (B, n_classes)
+        # x: (B, D, T)
+        if self.pool_type == "mean":
+            h = self.avg_pool(x).squeeze(-1)                 # (B, D)
+        else:
+            s = self.score(x.transpose(1, 2)).squeeze(-1)    # (B, T)
+            w = torch.softmax(s, dim=1)                       # (B, T)
+            h = torch.einsum("bt,bdt->bd", w, x)             # (B, D)
+            h = self.norm(h)                                  # (B, D)
+        return self.fc(h)                                     # (B, n_classes)
 
 
 class Mimir(nn.Module):
@@ -218,6 +242,7 @@ class Mimir(nn.Module):
         use_gcn: Optional[bool] = None,
         use_tcn: Optional[bool] = None,
         n_spatial_hops: int = 2,
+        pool: str = "attn",
     ):
         super().__init__()
         # None -> read the module-level switch AT CONSTRUCTION TIME, so a flag
@@ -244,8 +269,8 @@ class Mimir(nn.Module):
         # Two readouts over the SAME backbone, one per vocabulary. The
         # competition scores them separately, so each keeps its own decision
         # boundary.
-        self.head_primary = ClassifierHead(d_model, n_primary_classes)
-        self.head_moses = ClassifierHead(d_model, n_moses_classes)
+        self.head_primary = ClassifierHead(d_model, n_primary_classes, pool=pool)
+        self.head_moses = ClassifierHead(d_model, n_moses_classes, pool=pool)
         self._init_weights()
 
         print(f"[mimir] receptive field = {self.temporal.rf} samples "
@@ -255,7 +280,7 @@ class Mimir(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         print(f"[mimir] heads: primary {n_primary_classes}-way + "
               f"moses {n_moses_classes}-way "
-              f"(gcn={use_gcn}, tcn={use_tcn}, whiten={use_whiten})")
+              f"(gcn={use_gcn}, tcn={use_tcn}, whiten={use_whiten}, pool={pool})")
         print(f"[mimir] parameters = {n_params / 1e3:.1f}K")
 
     def _init_weights(self):
@@ -315,3 +340,13 @@ if __name__ == "__main__":
         assert torch.isfinite(p).all() and torch.isfinite(m_).all()
     print("ablation flags OK: (gcn, tcn) in {0,1}^2 - block types correct, "
           "outputs finite")
+
+    # Pooling arms: both mean and attention heads must satisfy the contract.
+    for pool in ("mean", "attn"):
+        mp = Mimir(n_channels=C, n_primary_classes=KP, n_moses_classes=KM,
+                   adj=adj, pool=pool)
+        assert mp.head_primary.pool_type == pool, "pool flag not threaded"
+        p, m_ = mp(x)
+        assert p.shape == (B, KP) and m_.shape == (B, KM)
+        assert torch.isfinite(p).all() and torch.isfinite(m_).all()
+    print("pooling OK: mean + attn heads both produce finite (B, K) logits")

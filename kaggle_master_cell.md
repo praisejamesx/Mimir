@@ -15,12 +15,16 @@ Copy the single code cell below into a new Kaggle notebook and run it.
 
 **Accelerator:** set the notebook to `GPU P100` (optionally `GPU T4 x2`; the
 pipeline auto-detects CUDA). On CPU-only notebooks the *same* cell works
-unchanged.
+unchanged, just far slower.
 
-**Expected:** measure (~1 min) -> plan -> train (~20+ epochs on ~78k windows)
--> inference on the holdout -> `submission_deep.csv`. Total wall clock ~3.1 h,
-leaving headroom for a re-run if something fails early. A sanity guard refuses
-to write a bias-only CSV if training went wrong.
+**Before the full run, prove the pipeline learns** (2 min, no submission):
+run `kaggle_run.py --overfit 256 --no-submit` and check that `primary top1`
+climbs toward 1.0. If it does not, stop — a full run cannot help and the bug is
+in data/label alignment or optimisation.
+
+**Expected (GPU P100):** measure (~1 min) -> plan -> train (20+ epochs on ~78k
+windows) -> inference on the holdout -> `submission_deep.csv`. A sanity guard
+refuses to write a bias-only CSV if training went wrong.
 
 ```python
 import os, subprocess, sys, glob
@@ -80,6 +84,7 @@ rc = subprocess.run(
     [sys.executable, "-u", "kaggle_run.py",
      "--budget-hours", "6.5", "--limit", "80000",
      "--epochs", "20", "--patience", "5",
+     "--pool", "attn", "--loss", "focal", "--class-weights", "sqrt-inv",
      "--submission", "/kaggle/working/submission_deep.csv"],
     cwd=REPO, check=False,
 ).returncode

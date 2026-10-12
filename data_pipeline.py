@@ -30,7 +30,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 import mne
 
@@ -725,11 +725,68 @@ def build_mne_sample(
     return train_ds, adj, meta, loader
 
 
-def _make_splits(train_ds, val_ds, batch_size: int, collate_fn=None):
-    """Train (shuffled) + val (sequential) loaders; val exposed on train_ds."""
+def _dataset_labels(dataset, head: str = "primary") -> torch.Tensor:
+    """Cheap int64 label vector for ``dataset`` without expensive H5 reads.
+
+    Prefers a materialised tensor attribute (MEGEpochDataset.y_primary/moses);
+    for MEGCompetitionDataset it derives labels from the index list + vocab
+    maps directly, so no window has to be loaded just to count classes.
+    """
+    col = 1 if head == "primary" else 2
+    attr = "y_primary" if head == "primary" else "y_moses"
+    if hasattr(dataset, attr):
+        return torch.as_tensor(getattr(dataset, attr), dtype=torch.int64)
+    if hasattr(dataset, "indices") and hasattr(dataset, "base"):
+        word_map = dataset.word_to_primary if head == "primary" else dataset.word_to_moses
+        ign = int(getattr(dataset, "ignore_index", -100))
+        samples = dataset.base.samples
+        return torch.tensor(
+            [word_map.get(normalize_word(samples[int(j)][5]), ign)
+             for j in dataset.indices],
+            dtype=torch.int64,
+        )
+    labels = [b[col] for b in DataLoader(dataset, batch_size=2048, num_workers=0)]
+    return torch.cat(labels) if labels else torch.zeros(0, dtype=torch.int64)
+
+
+def make_balanced_sampler(dataset, num_classes: int, ignore_index: int = -100,
+                          head: str = "primary") -> WeightedRandomSampler:
+    """WeightedRandomSampler that oversamples rare words (Zipfian rebalance).
+
+    Per-sample weight = sqrt-inverse class frequency (clamped [0.5, 5.0]), so
+    rare words are drawn far more often and receive gradient signal every epoch.
+    This is the sampling counterpart to the class-weighted loss, and fixes the
+    "rare classes get ~1/epoch -> no gradient" failure in
+    docs/00_STRATEGY_MASTER.md (killer #4).
+    """
+    y = _dataset_labels(dataset, head)
+    counts = torch.zeros(num_classes, dtype=torch.float64)
+    valid = y != ignore_index
+    if valid.any():
+        counts.index_add_(0, y[valid].long(),
+                          torch.ones_like(y[valid], dtype=torch.float64))
+    freq = counts / counts.sum().clamp(min=1.0)
+    class_w = (freq + 1e-6).pow(-0.5).clamp(0.5, 5.0)
+    sample_w = torch.ones(y.shape[0], dtype=torch.float64)
+    if valid.any():
+        sample_w[valid] = class_w[y[valid].long()]
+        sample_w[~valid] = class_w.mean()
+    return WeightedRandomSampler(sample_w, num_samples=y.shape[0], replacement=True)
+
+
+def _make_splits(train_ds, val_ds, batch_size: int, collate_fn=None,
+                 balanced_sampling: bool = False, num_classes: Optional[int] = None):
+    """Train (shuffled / balanced) + val (sequential) loaders; val on train_ds."""
+    sampler = None
+    shuffle = True
+    if balanced_sampling and num_classes:
+        sampler = make_balanced_sampler(train_ds, num_classes)
+        shuffle = False
+        print(f"[data_pipeline] balanced sampling ON "
+              f"({num_classes} classes, sqrt-inverse weights)")
     loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=0,
-        drop_last=False, pin_memory=False, collate_fn=collate_fn,
+        train_ds, batch_size=batch_size, shuffle=shuffle, sampler=sampler,
+        num_workers=0, drop_last=False, pin_memory=False, collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=0,
@@ -745,6 +802,7 @@ def build(
     data_path: Optional[Path] = None,
     batch_size: Optional[int] = None,
     max_windows: Optional[int] = None,
+    balanced_sampling: bool = False,
 ) -> tuple:
     """Dispatcher: same (dataset, adj, meta, loader) tuple from either source.
 
@@ -753,12 +811,14 @@ def build(
     dataset.val_loader/val_dataset for early stopping).
 
     max_windows caps the vocab-filtered window count (probe runs).
+    balanced_sampling oversamples rare words on the train split only.
     """
     if USE_REAL_DATA:
         return build_libribrain100(
             data_path=data_path,
             batch_size=batch_size or LIBRI_BATCH_SIZE,
             max_windows=max_windows,
+            balanced_sampling=balanced_sampling,
         )
     return build_mne_sample(data_path=data_path, batch_size=batch_size or 8)
 
@@ -789,6 +849,7 @@ def build_libribrain100(
     data_path: Optional[Path] = None,
     batch_size: int = LIBRI_BATCH_SIZE,
     max_windows: Optional[int] = None,
+    balanced_sampling: bool = False,
 ) -> tuple:
     """LibriBrain100 (Deep Track, subject 0) -> the 4-tuple.
 
@@ -941,7 +1002,8 @@ def build_libribrain100(
     )
 
     loader, val_loader = _make_splits(
-        train_ds, val_ds, batch_size, collate_fn=_competition_collate
+        train_ds, val_ds, batch_size, collate_fn=_competition_collate,
+        balanced_sampling=balanced_sampling, num_classes=len(primary_vocab),
     )
     print(
         f"[data_pipeline] LibriBrain100 ready: train {len(train_ds)} windows, "

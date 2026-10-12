@@ -32,6 +32,7 @@ def build_model_from_checkpoint(ckpt: dict) -> Mimir:
         use_whiten=hp.get("use_whiten", True),
         use_gcn=hp.get("use_gcn", True),
         use_tcn=hp.get("use_tcn", True),
+        pool=hp.get("pool", "mean"),
     )
     model.load_state_dict(ckpt["model_state"])
     model.eval()

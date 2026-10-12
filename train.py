@@ -156,32 +156,10 @@ def main(argv=None):
     dev = resolve_device(args.device)
     print(f"[train.main] device={dev}  epochs={args.epochs}  batch_size={args.batch_size}")
 
-    # When running with full data, set up data loading
+    # When running with full data, note that training is handled by kaggle_run.py
     if args.epochs > 1 or args.limit is not None:
-        import data_pipeline
-        from torch.utils.data.DataLoader import DataLoader
-        from torch.utils.data import Subset
-
-        # Use real data for full training runs
-        USE_REAL_DATA = True
-        data_pipeline.USE_REAL_DATA = USE_REAL_DATA
-
-        # Build dataset
-        from data_pipeline import LibriBrain100Detection
-        dataset = LibriBrain100Detection(root=args.data_root or '/kaggle/input/libribrain100')
-
-        # Limit windows if requested
-        if args.limit is not None:
-            indices = list(range(min(args.limit, len(dataset))))
-            dataset = Subset(dataset, indices)
-
-        loader = DataLoader(dataset, batch_size=args.batch_size,
-                           shuffle=True, num_workers=0, pin_memory=True)
-
-        # Compute class weights for focal loss
-        criterion_weight = compute_class_weights(dataset, num_classes=50, ignore_index=-100)
-        criterion = FocalLoss(weight=criterion_weight.to(dev), gamma=2.0,
-                              label_smoothing=0.1, ignore_index=-100)
+        print(f"[train.main] Full training mode: {args.epochs} epochs, limit={args.limit}")
+        print(f"[train.main] Training loop handled by kaggle_run.py run_training()")
     else:
         # Smoke mode: minimal setup
         criterion = FocalLoss(gamma=2.0, label_smoothing=0.1, ignore_index=-100)

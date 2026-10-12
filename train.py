@@ -142,7 +142,8 @@ def main(argv=None):
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"],
                         help="Compute device (default: auto)")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs (default: 1)")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: 8)")
+    parser.add_argument("--batch", "--batch-size", dest="batch_size", type=int, default=8,
+                        help="Batch size (default: 8)")
     parser.add_argument("--data-root", type=str, default=None,
                         help="Optional data root override")
     parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (default: 5)")
@@ -156,98 +157,124 @@ def main(argv=None):
     dev = resolve_device(args.device)
     print(f"[train.main] device={dev}  epochs={args.epochs}  batch_size={args.batch_size}")
 
-    # When running with full data, note that training is handled by kaggle_run.py
+    # Build a checkpoint path that submit.py's run_submission() expects.
+    # Anchor to this file (not CWD) so it matches kaggle_run.run_submission().
+    checkpoint_path = Path(__file__).resolve().parent / "checkpoints" / "mimir_libri_best.pt"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Full training mode (invoked by kaggle_run.py run_training()): build
+    # the real data pipeline + model and actually train.
+    # ------------------------------------------------------------------
     if args.epochs > 1 or args.limit is not None:
-        print(f"[train.main] Full training mode: {args.epochs} epochs, limit={args.limit}")
-        print(f"[train.main] Training loop handled by kaggle_run.py run_training()")
-    else:
-        # Smoke mode: minimal setup
-        criterion = FocalLoss(gamma=2.0, label_smoothing=0.1, ignore_index=-100)
+        import data_pipeline
 
-    # Build model - meta and adj will be provided by kaggle_run.py via the model
-    # In smoke mode, this will fail gracefully; in full mode, kaggle_run.py
-    # constructs the model and passes it via make_model's context
-    try:
-        # In full training mode, the model is constructed by kaggle_run.py's
-        # run_training which calls make_model. Here we just verify the setup.
-        if args.epochs > 1:
-            print(f"[train.main] Full training mode: {args.epochs} epochs, "
-                  f"limit={args.limit}, batch_size={args.batch_size}")
-        else:
-            print(f"[train.main] Smoke mode: {args.epochs} epoch(s)")
-    except Exception as e:
-        print(f"[train.main] Setup note: {e}")
+        print(f"[train.main] Full training mode: {args.epochs} epochs, "
+              f"limit={args.limit}, batch_size={args.batch_size}")
 
-    # Build optimizer (only if model exists)
-    if 'model' in dir() and model is not None:
+        data_pipeline.USE_REAL_DATA = True
+        dataset, adj, meta, loader = data_pipeline.build(
+            data_path=Path(args.data_root) if args.data_root else None,
+            batch_size=args.batch_size,
+            max_windows=args.limit,
+        )
+        val_loader = getattr(dataset, "val_loader", None)
+        print(f"[train.main] data ready: {len(dataset)} train windows, "
+              f"{len(getattr(dataset, 'val_dataset', []))} val windows")
+
+        model = make_model(meta, adj).to(dev)
+        augment = make_augment()
+
+        class_w = compute_class_weights(
+            dataset, num_classes=meta.n_primary_classes, ignore_index=-100
+        ).to(dev)
+        criterion = FocalLoss(weight=class_w, gamma=2.0,
+                              label_smoothing=0.1, ignore_index=-100)
+
         optimizer = torch.optim.AdamW(model.parameters(),
                                       lr=args.lr or CLOUD_LR,
                                       weight_decay=WEIGHT_DECAY)
-    else:
-        print(f"[train.main] Smoke mode: skipping optimizer creation (no model)")
-        optimizer = None
+        scheduler = get_scheduler(
+            optimizer, epochs=args.epochs,
+            warmup_epochs=max(1, min(5, args.epochs // 4)),
+            lr=args.lr or CLOUD_LR,
+        )
 
-    # Scheduler (only if optimizer exists)
-    if optimizer is not None:
-        scheduler = get_scheduler(optimizer, epochs=args.epochs, warmup_epochs=5, lr=CLOUD_LR)
-    else:
-        print(f"[train.main] Smoke mode: skipping scheduler (no optimizer)")
-        scheduler = None
+        best_top10 = 0.0
+        patience_counter = 0
+        final_epoch = 0
+        print(f"[train.main] Starting training: {args.epochs} epochs, "
+              f"patience={args.patience}")
 
-    # Training loop with checkpoint saving and early stopping
-    best_top10 = 0.0
-    patience_counter = 0
-    checkpoint_path = Path("./checkpoints/mimir_libri_best.pt")
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-    print(f"[train.main] Starting training: {args.epochs} epochs, patience={args.patience}")
-
-    # If we have a data loader, run training epochs
-    if args.epochs > 1 and 'loader' in dir() and loader is not None:
         for epoch in range(1, args.epochs + 1):
+            final_epoch = epoch
             print(f"\n=== Epoch {epoch}/{args.epochs} ===")
+            metrics = train_one_epoch(model, loader, criterion, optimizer,
+                                      augment, epoch)
+            print(f"[train.main] epoch {epoch} train: "
+                  f"primary={metrics['mean_primary']:.4f} "
+                  f"moses={metrics['mean_moses']:.4f} "
+                  f"({metrics['sec_per_batch'] * 1000:.1f} ms/batch)")
 
-            # Train one epoch
-            metrics = train_one_epoch(model, loader, criterion, optimizer, AUGMENT, epoch)
-
-            # Compute top-10 diagnostics
-            print(f"[train.main] Computing top-10 diagnostics...")
+            # Top-10 diagnostics on the held-out split when available.
+            diag_loader = val_loader if val_loader is not None else loader
             try:
-                diag = top10_diagnostics(model, loader, epoch)
+                diag = top10_diagnostics(model, diag_loader, epoch)
                 current_top10 = diag.get("overall_top10", 0.0)
-                print(f"[train.main] Epoch {epoch} top-10 accuracy: {current_top10:.4f}")
+                print(f"[train.main] Epoch {epoch} top-10 accuracy: "
+                      f"{current_top10:.4f}")
             except Exception as e:
                 print(f"[train.main] Diagnostics warning: {e}")
                 current_top10 = 0.0
 
-            # Step scheduler
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
 
-            # Save checkpoint if improved
-            if current_top10 > best_top10:
-                best_top10 = current_top10
-                patience_counter = 0
+            # Always write a checkpoint on epoch 1 so submit.py always has one;
+            # afterwards only overwrite on improvement.
+            if current_top10 > best_top10 or epoch == 1:
+                improved = current_top10 > best_top10
+                best_top10 = max(best_top10, current_top10)
+                patience_counter = 0 if improved else patience_counter
                 ckpt = {
                     "epoch": epoch,
-                    "state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "top10_accuracy": best_top10,
+                    "model_state": {k: v.detach().cpu()
+                                    for k, v in model.state_dict().items()},
+                    "optimizer_state": optimizer.state_dict(),
+                    "meta": asdict(meta),
+                    "hyperparams": {
+                        "d_model": D_MODEL,
+                        "tcn_layers": TCN_LAYERS,
+                        "dropout": DROPOUT,
+                        "causal": CAUSAL,
+                        "use_whiten": USE_WHITEN,
+                        "use_gcn": True,
+                        "use_tcn": True,
+                    },
+                    "adj": adj.detach().cpu() if torch.is_tensor(adj) else adj,
+                    "val_bal_top10": best_top10,
                 }
                 torch.save(ckpt, str(checkpoint_path))
                 print(f"[train.main] Checkpoint saved to {checkpoint_path} "
                       f"(top-10: {best_top10:.4f})")
             else:
                 patience_counter += 1
-                print(f"[train.main] No improvement. Patience counter: {patience_counter}/{args.patience}")
+                print(f"[train.main] No improvement. Patience counter: "
+                      f"{patience_counter}/{args.patience}")
 
-            # Early stopping
             if patience_counter >= args.patience:
-                print(f"[train.main] Early stopping triggered after {epoch} epochs")
+                print(f"[train.main] Early stopping triggered after "
+                      f"{epoch} epochs")
                 break
+    else:
+        # Smoke mode: no data, no training, no checkpoint.
+        print(f"[train.main] Smoke mode: {args.epochs} epoch(s)")
+        best_top10 = 0.0
+        final_epoch = 0
 
     print(f"\n=== Training complete ===")
     print(f"[train.main] Best top-10 accuracy: {best_top10:.4f}")
-    print(f"[train.main] Final epoch: {epoch if 'epoch' in dir() else 1}")
+    print(f"[train.main] Final epoch: {final_epoch}")
     print(f"[train.main] ALL TRAINING CHECKS PASSED at {datetime.now().isoformat()}")
     return 0
 
@@ -371,70 +398,65 @@ def evaluate(model, loader, criterion, augment, epoch: int = None) -> dict:
 
 
 def top10_diagnostics(model, loader, epoch: int = None) -> dict:
-    """Top-10 per-class accuracy (used for Kaggle competition metrics).
+    """Balanced top-10 accuracy over the full vocabulary (Kaggle metric).
 
-    Keys: acc_by_class (list of 10 floats, per-word top-10 accuracy),
-           hits_by_class / counts_by_class (accumulator tensors, same device as model),
-           overall_top10 (float).
+    For every held-out sample we check whether the true word index is among the
+    model's top-10 logits; per-class accuracy = hits(c) / samples(c); the
+    "balanced" score is the unweighted mean over classes with >=1 sample.
+
+    Device-safe: both accumulators are created on the model's device and filled
+    with ``index_add_`` (indices and target must share a device).
+
+    Keys: acc_by_class (list[C] floats), overall_top10 (float),
+          hits_by_class / counts_by_class (CPU tensors).
     """
     model.eval()
     dev = next(model.parameters()).device
 
-    n_classes = 10  # top-10 accuracy over the 50-word vocabulary
-    hits = torch.zeros(n_classes, dtype=torch.float64, device=dev)
-    counts = torch.zeros(n_classes, dtype=torch.float64, device=dev)
-
-    # We need the word indices to know which of the 10 top classes each sample belongs to.
-    # The dataset provides y_p (primary) and y_m (moses) as word indices in [0, 49].
-    # Top-10 per-class means: for each of the 10 classes (0..9), compute fraction of
-    # samples whose true word index falls in that class and was in the top-10 prediction.
-
+    hits = counts = None
     with torch.no_grad():
-        for x, y_p, y_m in loader:
+        for x, y_p, _ in loader:
             x = x.to(dev)
-            logits_p, _ = model(x)  # logits_p: (B, n_primary_classes=50)
+            y_p = y_p.to(dev)
+            logits_p, _ = model(x)                 # (B, C)
+            C = logits_p.shape[1]
+            if hits is None:
+                hits = torch.zeros(C, dtype=torch.float64, device=dev)
+                counts = torch.zeros(C, dtype=torch.float64, device=dev)
 
-            # Top-10 predictions
-            topk_vals, topk_idx = torch.topk(logits_p, k=10, dim=1)  # (B, 10)
+            k = min(10, C)
+            topk_idx = torch.topk(logits_p, k=k, dim=1).indices   # (B, k)
 
-            # For each of the 10 top positions, check if the true word is in top-10
-            # topk_idx: (B, 10), y_p: (B,) with values in [0, 49]
-            # We want per-class accuracy over 10 classes (0..9), so bin y_p into 10 bins
-            class_idx = y_p.clamp(max=9).long()  # bin [0,49] into 10 classes
+            valid = y_p != -100
+            if not valid.any():
+                continue
+            y = y_p[valid].long()                       # (N,)
+            tk = topk_idx[valid]                        # (N, k)
+            in_topk = (tk == y.unsqueeze(1)).any(dim=1).to(torch.float64)  # (N,)
 
-            # Expand class_idx to (B, 10) to match topk_idx
-            class_idx_exp = class_idx.view(-1, 1).expand(-1, 10)  # (B, 10)
+            counts.index_add_(0, y, torch.ones_like(y, dtype=torch.float64))
+            hits.index_add_(0, y, in_topk)
 
-            # Hit: true class matches one of the top-10 positions
-            # Actually, we check if the true word index appears in topk_idx
-            true_in_topk = (topk_idx == y_p.unsqueeze(1)).any(dim=1)  # (B,) bool
-
-            # Now accumulate per-class: for each sample whose true word is in class c,
-            # check if it was in top-10
-            for c in range(n_classes):
-                mask = (class_idx == c) & true_in_topk
-                hits[c] += mask.sum().float()
-                counts[c] += mask.sum().float()  # same mask: only count if true word in this class AND in top-10
-
-    # Compute overall top-10 accuracy and per-class
-    total_hits = hits.sum().item()
-    total_counts = counts.sum().item()
-    overall_top10 = total_hits / total_counts if total_counts > 0 else 0.0
-
-    acc_by_class = [(h / max(c, 1)).item() for h, c in zip(hits, counts)]
+    if hits is None or counts is None or counts.sum().item() == 0:
+        overall_top10 = 0.0
+        acc_by_class: list[float] = []
+    else:
+        per_class = hits / counts.clamp(min=1.0)
+        seen = counts > 0
+        overall_top10 = per_class[seen].mean().item() if seen.any() else 0.0
+        acc_by_class = per_class.tolist()
 
     result = {
-        "acc_by_class": acc_by_class,  # list of 10 floats
+        "acc_by_class": acc_by_class,
         "overall_top10": overall_top10,
+        "hits_by_class": hits.cpu() if hits is not None else torch.zeros(0),
+        "counts_by_class": counts.cpu() if counts is not None else torch.zeros(0),
     }
 
-    # Also include the raw accumulator info (as CPU tensors for logging)
-    result["hits_by_class"] = hits.cpu()
-    result["counts_by_class"] = counts.cpu()
-
     if epoch is not None:
-        print(f"  epoch {epoch} top-10 diagnostics: acc_by_class={acc_by_class}  "
-              f"overall_top10={overall_top10:.4f}  total={total_counts}")
+        print(f"  epoch {epoch} top-10 diagnostics: "
+              f"balanced_top10={overall_top10:.4f}  "
+              f"classes_seen={int((counts > 0).sum().item()) if counts is not None else 0}")
 
     return result
 

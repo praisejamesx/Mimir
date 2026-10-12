@@ -17,25 +17,20 @@ Copy the single code cell below into a new Kaggle notebook and run it.
 pipeline auto-detects CUDA). On CPU-only notebooks the *same* cell works
 unchanged, just far slower.
 
-**Before the full run, prove the pipeline learns** (2 min, no submission):
-run `kaggle_run.py --overfit 256 --no-submit` and check that `primary top1`
-climbs toward 1.0. If it does not, stop — a full run cannot help and the bug is
-in data/label alignment or optimisation.
-
-**Objective is now plain CE, no class weights, no balanced sampling.** Every
-real run with weighted focal + sqrt-inverse weights + the balanced sampler
-collapsed to exactly chance (balanced Top-10 0.2000, top-1 = 1/50): the model
-just echoed the class priors. The only positive on-real-data result is the
-plain-CE baseline (0.223 balanced, strategy doc). The flags are kept for
-experiments, but the master cell runs the proven objective with the attention
-readout added.
-
-**Expected (GPU P100):** measure (~1 min) -> plan -> train (20+ epochs on ~78k
-windows) -> inference on the holdout -> `submission_deep.csv`. A sanity guard
-refuses to write a bias-only CSV if training went wrong.
+**How to run (two runs, one cell):**
+1. Paste the code below into a notebook set to GPU P100. Run it once.
+2. The first run is a **3-minute check** that the pipeline can learn on real data
+   (it trains on 256 windows, no submission, takes ~3 min).
+3. If the printed result shows `primary top1` near 1.0, flip the switch
+   `GATE_ONLY = False` at the top of the cell and press Run again. That is the
+   full training run (hours), which writes `submission_deep.csv`.
+4. Download it and submit on the competition page.
 
 ```python
 import os, subprocess, sys, glob
+
+# ---- 0. ONE switch: True = 3-min learnability check; False = full run --------
+GATE_ONLY = True
 
 # ---- 1. Dependencies ---------------------------------------------------------
 for pkg in ("mne", "pnpl"):
@@ -85,24 +80,27 @@ if comp_inputs and os.listdir(comp_inputs[0]):
 else:
     os.environ["MIMIR_DATA_ROOT"] = "/kaggle/tmp"
 os.environ["CACHE_WINDOWS"] = "1"
-
-# ---- 4. GPU run (auto-sizes windows x epochs to fit the wall-clock budget) ----
 os.environ["LIBRI_CACHE_MEMORY_LIMIT_BYTES"] = "24000000000"   # 24 GiB cache
-rc = subprocess.run(
-    [sys.executable, "-u", "kaggle_run.py",
-     "--budget-hours", "6.5", "--limit", "80000",
-     "--epochs", "20", "--patience", "5",
-     "--pool", "attn", "--loss", "ce", "--class-weights", "none",
-     "--no-balanced-sampling",
-     "--submission", "/kaggle/working/submission_deep.csv"],
-    cwd=REPO, check=False,
-).returncode
-if rc != 0:
-    raise SystemExit(f"kaggle_run.py exited with {rc}")
 
-print("\n[master cell] submission ready - download submission_deep.csv from")
-print("[master cell] the notebook's right-hand file panel / Output tab and")
-print("[master cell] submit it on the competition page.")
+# ---- 4. Run: gate (3 min) or full training (hours) ----------------------------
+cmd = ["kaggle_run.py", "--overfit", "256", "--no-submit"] if GATE_ONLY else [
+    "kaggle_run.py", "--budget-hours", "6.5", "--limit", "80000",
+    "--epochs", "20", "--patience", "5",
+    "--pool", "attn", "--loss", "ce", "--class-weights", "none",
+    "--no-balanced-sampling",
+    "--submission", "/kaggle/working/submission_deep.csv"]
+rc = subprocess.run([sys.executable, "-u"] + cmd, cwd=REPO, check=False).returncode
+if rc != 0:
+    raise SystemExit(f"kaggle_run.py exited with rc={rc}")
+
+if GATE_ONLY:
+    print("\n[gate] PASS if 'primary top1' printed near 1.0. Then set")
+    print("[gate] GATE_ONLY = False at the top of this cell and Run again")
+    print("[gate] to do the full training run (hours).")
+else:
+    print("\n[master cell] submission ready - download submission_deep.csv from")
+    print("[master cell] the notebook's right-hand file panel / Output tab and")
+    print("[master cell] submit it on the competition page.")
 ```
 
 CPU-only / extra-spare-time variants (change one line, everything else the same):

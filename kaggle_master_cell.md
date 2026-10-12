@@ -22,6 +22,14 @@ run `kaggle_run.py --overfit 256 --no-submit` and check that `primary top1`
 climbs toward 1.0. If it does not, stop — a full run cannot help and the bug is
 in data/label alignment or optimisation.
 
+**Objective is now plain CE, no class weights, no balanced sampling.** Every
+real run with weighted focal + sqrt-inverse weights + the balanced sampler
+collapsed to exactly chance (balanced Top-10 0.2000, top-1 = 1/50): the model
+just echoed the class priors. The only positive on-real-data result is the
+plain-CE baseline (0.223 balanced, strategy doc). The flags are kept for
+experiments, but the master cell runs the proven objective with the attention
+readout added.
+
 **Expected (GPU P100):** measure (~1 min) -> plan -> train (20+ epochs on ~78k
 windows) -> inference on the holdout -> `submission_deep.csv`. A sanity guard
 refuses to write a bias-only CSV if training went wrong.
@@ -84,7 +92,8 @@ rc = subprocess.run(
     [sys.executable, "-u", "kaggle_run.py",
      "--budget-hours", "6.5", "--limit", "80000",
      "--epochs", "20", "--patience", "5",
-     "--pool", "attn", "--loss", "focal", "--class-weights", "sqrt-inv",
+     "--pool", "attn", "--loss", "ce", "--class-weights", "none",
+     "--no-balanced-sampling",
      "--submission", "/kaggle/working/submission_deep.csv"],
     cwd=REPO, check=False,
 ).returncode

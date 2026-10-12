@@ -26,20 +26,24 @@ LR = 1e-3
 WEIGHT_DECAY = 1e-4
 
 # Readout + objective. Attention pooling preserves the temporal trajectory that
-# carries word identity (mean pooling collapsed balanced Top-10 to chance);
-# sqrt-inverse-frequency class weights + label smoothing counter the Zipfian
-# 50-word label distribution.
+# carries word identity (mean pooling collapsed balanced Top-10 to chance).
+# Objective: PLAIN CE is the only configuration with a positive on-real-data
+# result (baseline 0.223 balanced, docs/00_STRATEGY_MASTER.md). Weighted focal
+# + sqrt-inverse class weights + balanced sampling were held up as the Zipfian
+# fix, but every real run with them collapsed to exactly chance (0.2000 /
+# top-1 1/50) -- they push all gradient toward un-learnable rare words and the
+# model retreats to echoing the class priors. Kept available via flags below.
 POOL = "attn"
-LOSS = "focal"           # "focal" or "ce"
+LOSS = "ce"              # "focal" or "ce"
 GAMMA = 2.0
-CLASS_WEIGHTS = "sqrt-inv"   # "sqrt-inv" or "none"
+CLASS_WEIGHTS = "none"   # "sqrt-inv" or "none" (empirically harmful on real data)
 LABEL_SMOOTHING = 0.1
 
 # Optimization.
 ACCUM_STEPS = 4          # effective batch = batch_size * accum_steps
 CLIP_GRAD = 1.0          # real gradient clip (the old 1e9 was effectively off)
 WARMUP_EPOCHS = 5
-BALANCED_SAMPLING = True
+BALANCED_SAMPLING = False   # sqrt-inverse WeightedRandomSampler (see note above)
 
 # Anti-overfitting augmentation (data_pipeline.TrialAugmentation). Applied only
 # in train mode; evaluate() forces eval() so validation stays clean.

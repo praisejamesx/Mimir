@@ -139,6 +139,10 @@ def main(argv=None):
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: 8)")
     parser.add_argument("--data-root", type=str, default=None,
                         help="Optional data root override")
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (default: 5)")
+    parser.add_argument("--limit", type=int, default=None, help="Max windows to train (default: None)")
+    parser.add_argument("--train-metric-batches", type=int, default=300,
+                        help="Number of batches for metric computation (default: 300)")
     args = parser.parse_args(argv)
 
     dev = resolve_device(args.device)

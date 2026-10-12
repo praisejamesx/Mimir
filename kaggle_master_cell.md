@@ -84,8 +84,11 @@ os.environ["LIBRI_CACHE_MEMORY_LIMIT_BYTES"] = "24000000000"   # 24 GiB cache
 
 # ---- 4. Run: gate (3 min) or full training (hours) ----------------------------
 cmd = ["kaggle_run.py", "--overfit", "256", "--no-submit"] if GATE_ONLY else [
-    "kaggle_run.py", "--budget-hours", "6.5", "--limit", "80000",
-    "--epochs", "20", "--patience", "5",
+    # 20k windows x many epochs: the gate proved primary needs ~30+ epochs just
+    # to lift off chance, so the 20-epoch/~78k-window profile killed itself
+    # before learning began. Same budget, 4x fewer windows -> ~4x more epochs.
+    "kaggle_run.py", "--budget-hours", "6.5", "--limit", "20000",
+    "--epochs", "90", "--patience", "18",
     "--pool", "attn", "--loss", "ce", "--class-weights", "none",
     "--no-balanced-sampling",
     "--submission", "/kaggle/working/submission_deep.csv"]
@@ -107,7 +110,7 @@ CPU-only / extra-spare-time variants (change one line, everything else the same)
 
 - `--budget-hours 6.5` -> `--budget-hours 11` (a full CPU session can train far
   more, but stays under the 12 h notebook cap).
-- `--limit 80000` / `--epochs 20` are only ceilings; the auto-sizer picks the
+- `--limit 20000` / `--epochs 90` are only ceilings; the auto-sizer picks the
   largest (windows, epochs) that fit whatever device and budget you gave it.
 - Lower `LIBRI_CACHE_MEMORY_LIMIT_BYTES` to `14000000000` (14 GiB, the default)
   if your notebook is short on RAM.

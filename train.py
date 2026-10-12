@@ -42,7 +42,7 @@ LABEL_SMOOTHING = 0.1
 # Optimization.
 ACCUM_STEPS = 4          # effective batch = batch_size * accum_steps
 CLIP_GRAD = 1.0          # real gradient clip (the old 1e9 was effectively off)
-WARMUP_EPOCHS = 5
+WARMUP_EPOCHS = 2   # peaked LR by epoch 3; a 5-epoch warmup wastes the few epochs we have
 BALANCED_SAMPLING = False   # sqrt-inverse WeightedRandomSampler (see note above)
 
 # Anti-overfitting augmentation (data_pipeline.TrialAugmentation). Applied only
@@ -329,7 +329,7 @@ def _run_full(args, dev, hp, checkpoint_path):
         lr=args.lr or CLOUD_LR,
     )
 
-    best_top10, patience_counter, final_epoch = 0.0, 0, 0
+    best_top10, best_combined, patience_counter, final_epoch = 0.0, 0.0, 0, 0
     diag_loader = val_loader if val_loader is not None else loader
     print(f"[train.main] Starting training: {args.epochs} epochs, patience={args.patience}")
 
@@ -346,6 +346,7 @@ def _run_full(args, dev, hp, checkpoint_path):
         diag_p = top10_diagnostics(model, diag_loader, head="primary", epoch=epoch)
         diag_m = top10_diagnostics(model, diag_loader, head="moses")
         current_top10 = diag_p["overall_top10"]
+        current_combined = (current_top10 + diag_m["overall_top10"]) / 2.0
         print(f"[train.main] Epoch {epoch} balanced: "
               f"primary top10={diag_p['overall_top10']:.4f} "
               f"top1={diag_p['balanced_top1']:.4f} | "
@@ -355,15 +356,24 @@ def _run_full(args, dev, hp, checkpoint_path):
         if scheduler is not None:
             scheduler.step()
 
-        # Always write a checkpoint on epoch 1 so submit.py always has one.
-        improved = current_top10 > best_top10
-        if improved or epoch == 1:
+        # Checkpoint follows the competition metric (primary balanced Top-10);
+        # always write one on epoch 1 so submit.py always has something to load.
+        if epoch == 1 or current_top10 > best_top10:
             best_top10 = max(best_top10, current_top10)
-            patience_counter = 0 if improved else patience_counter
             _save_checkpoint(checkpoint_path, model, optimizer, meta, adj, hp,
                              epoch, best_top10)
             print(f"[train.main] Checkpoint saved to {checkpoint_path} "
-                  f"(balanced top-10: {best_top10:.4f})")
+                  f"(primary balanced top-10: {best_top10:.4f})")
+
+        # Early stopping monitors the COMBINED balanced Top-10 instead of
+        # primary: the moses head learns within a few epochs and keeps the run
+        # alive while the slow primary head develops (the overfit gate showed
+        # primary needs ~30+ epochs just to separate; patience keyed to
+        # primary's chance-level val would kill the run first).
+        improved = current_combined > best_combined
+        if improved or epoch == 1:
+            best_combined = max(best_combined, current_combined)
+            patience_counter = 0 if improved else patience_counter
         else:
             patience_counter += 1
             print(f"[train.main] No improvement. Patience counter: "

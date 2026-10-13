@@ -177,12 +177,14 @@ def solve_plan(args, sec_per_window: float, n_full: int) -> dict:
         metric_windows * METRIC_FORWARD_FACTOR
     epoch_h = epoch_windows * sec_per_window / 3600.0
 
-    # Budget-available epochs are the binding constraint; the user's --epochs
-    # (or --max-epochs) acts only as an upper bound on top of that.
+    # Budget-available epochs are the binding constraint; an explicit --epochs
+    # is the ceiling, otherwise --max-epochs (default 20) caps it. (Using the
+    # default max-epochs to clamp an explicit --epochs silently turned
+    # "--epochs 90" into 20 and re-created the too-short run we are fixing.)
     epochs_avail = int(avail_h / epoch_h) if epoch_h > 0 else args.max_epochs
-    epochs_cap = args.epochs or args.max_epochs
+    epochs_cap = args.epochs if args.epochs is not None else args.max_epochs
     epochs = min(epochs_avail, epochs_cap)
-    epochs = max(args.min_epochs, min(epochs, args.max_epochs))
+    epochs = max(args.min_epochs, epochs)
 
     patience = min(args.patience, max(1, epochs - 1))
     train_h = epochs * epoch_h

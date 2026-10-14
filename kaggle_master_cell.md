@@ -23,8 +23,9 @@ unchanged, just far slower.
    (it trains on 256 windows, no submission, takes ~3 min).
 3. If the printed result shows `primary top1` printed above 0.9, flip the switch
    `GATE_ONLY = False` at the top of the cell and press Run again. That is the
-   full training run (hours), which writes `submission_deep.csv` and calls
-   `submit.py` with `--prior-tau 0.5`.
+   full training run (hours), which writes `submission_deep.csv` using the V2
+   defaults (focal + balanced + no whiten + D_MODEL=128 + TCN=8) and the fixed
+   cap removal.
 4. Download it and submit on the competition page.
 
 ```python

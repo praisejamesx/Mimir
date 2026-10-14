@@ -200,7 +200,7 @@ def solve_plan(args, sec_per_window: float, n_full: int) -> dict:
         "train_h": train_h,
         "budget_h": budget_h,
         "avail_h": avail_h,
-        "cache_n_cap": cache_cap,
+        "cache_n_cap": 0,
         "cache_gb": data_pipeline.LIBRI_CACHE_MEMORY_LIMIT / 2**30,
     }
 

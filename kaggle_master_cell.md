@@ -23,9 +23,7 @@ unchanged, just far slower.
    (it trains on 256 windows, no submission, takes ~3 min).
 3. If the printed result shows `primary top1` printed above 0.9, flip the switch
    `GATE_ONLY = False` at the top of the cell and press Run again. That is the
-   full training run (hours), which writes `submission_deep.csv` using the V2
-   defaults (focal + balanced + no whiten + D_MODEL=128 + TCN=8) and the fixed
-   cap removal.
+   full training run (hours), which writes `submission_deep.csv`.
 4. Download it and submit on the competition page.
 
 ```python
@@ -86,6 +84,10 @@ cmd = ["kaggle_run.py", "--overfit", "256", "--no-submit"] if GATE_ONLY else [
     "--limit", "20000",
     "--epochs", "90",
     "--patience", "18",
+    "--pool", "attn",
+    "--loss", "ce",
+    "--class-weights", "none",
+    "--no-balanced-sampling",
     "--submission", "/kaggle/working/submission_deep.csv"]
 rc = subprocess.run([sys.executable, "-u"] + cmd, cwd=REPO, check=False).returncode
 if rc != 0:

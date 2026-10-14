@@ -37,6 +37,10 @@ POOL = "attn"
 LOSS = "ce"              # "focal" or "ce"
 GAMMA = 2.0
 CLASS_WEIGHTS = "none"   # "sqrt-inv" or "none" (empirically harmful on real data)
+MODEL = "v3"             # "v3" (spectral-spatial successor) or "v1" (legacy GCN+TCN)
+MOSES_WEIGHT = 0.2       # aux head weight; v1 used equal sum (1.0) which let
+                         # moses (0.6) drag the backbone while primary (2.4)
+                         # stayed at chance
 LABEL_SMOOTHING = 0.1
 
 # Optimization.
@@ -227,7 +231,11 @@ def main(argv=None):
     parser.add_argument("--class-weights", choices=["sqrt-inv", "none"], default=CLASS_WEIGHTS,
                         help="Per-head sqrt-inverse-frequency class weighting")
     parser.add_argument("--pool", choices=["mean", "attn"], default=POOL,
-                        help="Classifier head pooling (default: attn)")
+                        help="Classifier head pooling (v1 only; v3 uses mean+logpower)")
+    parser.add_argument("--model", choices=["v1", "v3"], default=MODEL,
+                        help="Backbone (default: v3 spectral-spatial successor)")
+    parser.add_argument("--moses-weight", type=float, default=MOSES_WEIGHT,
+                        help="Auxiliary moses head weight (default: 0.2)")
     parser.add_argument("--d-model", type=int, default=D_MODEL)
     parser.add_argument("--tcn-layers", type=int, default=TCN_LAYERS)
     parser.add_argument("--dropout", type=float, default=DROPOUT)
@@ -255,6 +263,8 @@ def main(argv=None):
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
     hp = {
+        "model": args.model,
+        "moses_weight": args.moses_weight,
         "d_model": args.d_model,
         "tcn_layers": args.tcn_layers,
         "dropout": args.dropout,
@@ -338,7 +348,8 @@ def _run_full(args, dev, hp, checkpoint_path):
         print(f"\n=== Epoch {epoch}/{args.epochs} ===")
         metrics = train_one_epoch(model, loader, crit_p, crit_m, optimizer, augment, epoch,
                                   accum_steps=args.accum_steps, clip_grad=args.clip_grad,
-                                  augment_on=args.augment)
+                                  augment_on=args.augment,
+                                  moses_weight=args.moses_weight)
         print(f"[train.main] epoch {epoch} train: primary={metrics['mean_primary']:.4f} "
               f"moses={metrics['mean_moses']:.4f} "
               f"({metrics['sec_per_batch'] * 1000:.1f} ms/batch)")
@@ -365,12 +376,10 @@ def _run_full(args, dev, hp, checkpoint_path):
             print(f"[train.main] Checkpoint saved to {checkpoint_path} "
                   f"(primary balanced top-10: {best_top10:.4f})")
 
-        # Early stopping monitors the COMBINED balanced Top-10 instead of
-        # primary: the moses head learns within a few epochs and keeps the run
-        # alive while the slow primary head develops (the overfit gate showed
-        # primary needs ~30+ epochs just to separate; patience keyed to
-        # primary's chance-level val would kill the run first).
-        improved = current_combined > best_combined
+        # Early stopping monitors PRIMARY balanced Top-10 (the competition
+        # metric). Monitoring the combined score hid primary stagnation behind
+        # the easy moses head in prior runs.
+        improved = current_top10 > best_combined
         if improved or epoch == 1:
             best_combined = max(best_combined, current_combined)
             patience_counter = 0 if improved else patience_counter
@@ -433,11 +442,22 @@ def _run_overfit(args, dev, hp):
     return best_top1, final_epoch
 
 
-def make_model(meta, adj, hp: dict = None) -> Mimir:
-    """Build Mimir from PipelineMeta + hyperparameters (falls back to module
-    defaults for any key omitted, so kaggle_run's measurement build works)."""
-    from mimir_model import Mimir
+def make_model(meta, adj, hp: dict = None):
+    """Build backbone from PipelineMeta + hyperparameters.
+
+    model="v3" (default): spectral-spatial successor (mimir_v3.py).
+    model="v1": legacy GCN+TCN (mimir_model.py).
+    """
     hp = hp or {}
+    if hp.get("model", MODEL) == "v3":
+        from mimir_v3 import MimirV3
+        return MimirV3(
+            n_channels=meta.n_channels,
+            n_primary_classes=meta.n_primary_classes,
+            n_moses_classes=meta.n_moses_classes,
+            dropout=hp.get("dropout", DROPOUT),
+        )
+    from mimir_model import Mimir
     return Mimir(
         n_channels=meta.n_channels,
         n_primary_classes=meta.n_primary_classes,
@@ -465,13 +485,12 @@ def make_augment() -> data_pipeline.TrialAugmentation:
 
 def train_one_epoch(model, loader, criterion_p, criterion_m, optimizer, augment, epoch: int,
                     accum_steps: int = 1, clip_grad: float = CLIP_GRAD,
-                    augment_on: bool = True) -> dict:
-    """One training epoch with gradient accumulation and both-head losses.
+                    augment_on: bool = True, moses_weight: float = MOSES_WEIGHT) -> dict:
+    """One training epoch with gradient accumulation and weighted heads.
 
-    The two heads use separate criteria (independent vocabularies => independent
-    class weights). Gradients are accumulated over ``accum_steps`` micro-batches
-    before a clipped step, so the effective batch is ``batch_size*accum_steps``
-    at the memory cost of one micro-batch.
+    Primary is the competition metric; moses is auxiliary (0.2). v1 used an
+    equal sum, letting the easy moses head (0.6) dominate the hard primary
+    head (2.4) while primary stayed at chance.
     """
     model.train()
     augment.train()
@@ -491,7 +510,7 @@ def train_one_epoch(model, loader, criterion_p, criterion_m, optimizer, augment,
         logits_p, logits_m = model(x)
         loss_primary = criterion_p(logits_p, y_p)
         loss_moses = criterion_m(logits_m, y_m)
-        loss = loss_primary + loss_moses
+        loss = loss_primary + moses_weight * loss_moses
         (loss / accum_steps).backward()
 
         at_step = ((i + 1) % accum_steps == 0)

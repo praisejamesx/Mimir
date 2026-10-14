@@ -81,6 +81,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clip-grad", type=float, default=train_mod.CLIP_GRAD)
     p.add_argument("--no-balanced-sampling", dest="balanced_sampling",
                    action="store_false", default=train_mod.BALANCED_SAMPLING)
+    p.add_argument("--model", choices=["v1", "v3"], default=train_mod.MODEL)
+    p.add_argument("--moses-weight", type=float, default=train_mod.MOSES_WEIGHT)
     p.add_argument("--overfit", type=int, default=0,
                    help="diagnostic: train on N fixed windows only, then exit")
     return p.parse_args()
@@ -224,6 +226,11 @@ def run_training(plan: dict, args) -> None:
         "--accum-steps", str(args.accum_steps),
         "--clip-grad", str(args.clip_grad),
     ]
+    # v3 flags only if the (possibly uploaded older) train.py supports them.
+    if hasattr(train_mod, "MODEL"):
+        sys.argv += ["--model", args.model]
+    if hasattr(train_mod, "MOSES_WEIGHT"):
+        sys.argv += ["--moses-weight", str(args.moses_weight)]
     if not args.balanced_sampling:
         sys.argv += ["--no-balanced-sampling"]
     if args.lr is not None:
@@ -283,6 +290,8 @@ def main() -> None:
             "--d-model", str(args.d_model), "--tcn-layers", str(args.tcn_layers),
             "--dropout", str(args.dropout),
         ]
+        if hasattr(train_mod, "MODEL"):
+            sys.argv += ["--model", args.model]
         train_mod.main()
         return
 

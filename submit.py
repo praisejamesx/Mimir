@@ -16,24 +16,33 @@ SUBMIT_BATCH_SIZE = 64
 SEED = 0
 
 
-def build_model_from_checkpoint(ckpt: dict) -> Mimir:
+def build_model_from_checkpoint(ckpt: dict):
     """Reconstruct the exact architecture the checkpoint was trained with."""
     meta = ckpt["meta"]
     hp = ckpt["hyperparams"]
-    model = Mimir(
-        n_channels=meta["n_channels"],
-        n_primary_classes=meta["n_primary_classes"],
-        n_moses_classes=meta["n_moses_classes"],
-        adj=ckpt["adj"],
-        d_model=hp.get("d_model", 64),
-        tcn_layers=hp.get("tcn_layers", 7),
-        dropout=hp.get("dropout", 0.1),
-        causal=hp.get("causal", False),
-        use_whiten=hp.get("use_whiten", True),
-        use_gcn=hp.get("use_gcn", True),
-        use_tcn=hp.get("use_tcn", True),
-        pool=hp.get("pool", "mean"),
-    )
+    if hp.get("model", "v1") == "v3":
+        from mimir_v3 import MimirV3
+        model = MimirV3(
+            n_channels=meta["n_channels"],
+            n_primary_classes=meta["n_primary_classes"],
+            n_moses_classes=meta["n_moses_classes"],
+            dropout=hp.get("dropout", 0.25),
+        )
+    else:
+        model = Mimir(
+            n_channels=meta["n_channels"],
+            n_primary_classes=meta["n_primary_classes"],
+            n_moses_classes=meta["n_moses_classes"],
+            adj=ckpt["adj"],
+            d_model=hp.get("d_model", 64),
+            tcn_layers=hp.get("tcn_layers", 7),
+            dropout=hp.get("dropout", 0.1),
+            causal=hp.get("causal", False),
+            use_whiten=hp.get("use_whiten", True),
+            use_gcn=hp.get("use_gcn", True),
+            use_tcn=hp.get("use_tcn", True),
+            pool=hp.get("pool", "mean"),
+        )
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     return model

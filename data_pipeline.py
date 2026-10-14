@@ -917,9 +917,14 @@ def build_libribrain100(
         )
     print(f"[data_pipeline] vocab filter: kept {len(keep)} / {len(ds.samples)} "
           f"windows (dropped {len(ds.samples) - len(keep)} out-of-vocab words)")
-    if max_windows is not None:
-        keep = keep[:max_windows]
-        print(f"[data_pipeline] probe limit: restricted to first "
+    if max_windows is not None and len(keep) > max_windows:
+        # Seeded shuffle BEFORE slicing: keep[:N] on raw dataset order is
+        # chronologically biased (early runs only). Shuffle first so a capped
+        # run is a representative subsample, then the 90/10 split below.
+        sub_rng = torch.Generator().manual_seed(LIBRI_SEED + 1)
+        sub_perm = torch.randperm(len(keep), generator=sub_rng).tolist()
+        keep = [keep[p] for p in sub_perm[:max_windows]]
+        print(f"[data_pipeline] probe limit: seeded-shuffled subsample of "
               f"{max_windows} windows")
 
     # Seeded 90/10 split on the index space; both wrapper datasets share the

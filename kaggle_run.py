@@ -158,11 +158,11 @@ def solve_plan(args, sec_per_window: float, n_full: int) -> dict:
     budget_h = max(0.5, args.budget_hours)
     avail_h = max(0.0, budget_h - overhead_h)
 
-    cache_cap = data_pipeline.LIBRI_CACHE_MEMORY_LIMIT // WINDOW_BYTES
-
-    # Windows that fit: budget > cache cap > user limit > full dataset.
+    # Windows that fit: budget > user limit > full dataset.
+    # cache_cap is informational only; full-data runs disable caching
+    # (LIBRI_CACHE_WINDOWS=0) or increase LIBRI_CACHE_MEMORY_LIMIT_BYTES.
     n_budget = int(avail_h * 3600.0 / sec_per_window)
-    candidates: list[int] = [n_budget, cache_cap, n_full]
+    candidates: list[int] = [n_budget, n_full]
     if args.limit is not None:
         candidates.append(args.limit)
     n_use = min(candidates)

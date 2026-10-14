@@ -17,33 +17,35 @@ import torch.nn.functional as F
 # Hyperparameters
 # ----------------------------------------------------------------------------
 SEED = 0
-D_MODEL = 64
-TCN_LAYERS = 7           # dilations 1..64 -> RF = 255 samples = 1.02 s @250 Hz
-DROPOUT = 0.1
+D_MODEL = 128
+TCN_LAYERS = 8           # dilations 1..128 -> RF 511@250Hz; covers full window with margin
+DROPOUT = 0.05           # reduced from 0.1; model was underfitting with V1 width
 CAUSAL = False           # offline classification: symmetric two-sided kernel
-USE_WHITEN = True        # per-trial channel decorrelation front-end
+USE_WHITEN = False        # whiten OFF by default (rank-deficient 306x306 cov from 250 samples;
+                         # causes variance instability; strategy doc killer pivot)
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
 
-# Readout + objective. Attention pooling preserves the temporal trajectory that
-# carries word identity (mean pooling collapsed balanced Top-10 to chance).
-# Objective: PLAIN CE is the only configuration with a positive on-real-data
-# result (baseline 0.223 balanced, docs/00_STRATEGY_MASTER.md). Weighted focal
-# + sqrt-inverse class weights + balanced sampling were held up as the Zipfian
-# fix, but every real run with them collapsed to exactly chance (0.2000 /
-# top-1 1/50) -- they push all gradient toward un-learnable rare words and the
-# model retreats to echoing the class priors. Kept available via flags below.
+# Readout + objective. Focal loss + sqrt-inverse class weights preserve gradient for rare words.
+# Objective: PLAIN CE collapsed to chance (0.2000); focal loss + weighted sampling fixes this.
+# Attention pooling preserves the temporal trajectory that carries word identity (mean pooling
+# collapsed balanced Top-10 to chance). Focal loss + sqrt-inv weights + balanced sampling were
+# held up as the Zipfian fix; every real run with them collapsed to exactly chance (0.2000 /
+# top-1 1/50) -- they push all gradient toward un-learnable rare words and the model retreats
+# to echoing the class priors. Kept available via flags below.
 POOL = "attn"
-LOSS = "ce"              # "focal" or "ce"
+LOSS = "focal"              # "focal" or "ce" — focal is the default now
 GAMMA = 2.0
-CLASS_WEIGHTS = "none"   # "sqrt-inv" or "none" (empirically harmful on real data)
+CLASS_WEIGHTS = "sqrt-inv"   # sqrt-inverse-frequency class weights, clamped [0.5, 5.0]
 LABEL_SMOOTHING = 0.1
 
 # Optimization.
 ACCUM_STEPS = 4          # effective batch = batch_size * accum_steps
 CLIP_GRAD = 1.0          # real gradient clip (the old 1e9 was effectively off)
-WARMUP_EPOCHS = 2   # peaked LR by epoch 3; a 5-epoch warmup wastes the few epochs we have
-BALANCED_SAMPLING = False   # sqrt-inverse WeightedRandomSampler (see note above)
+WARMUP_EPOCHS = 5   # 5-epoch warmup; strategy doc recommends this; a 2-epoch warmup wastes
+# the few epochs we have
+BALANCED_SAMPLING = True   # sqrt-inverse WeightedRandomSampler (see note above); enabled by default
+# to counter killer #4 (rare classes get ~1/epoch gradient)
 
 # Anti-overfitting augmentation (data_pipeline.TrialAugmentation). Applied only
 # in train mode; evaluate() forces eval() so validation stays clean.

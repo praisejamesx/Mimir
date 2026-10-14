@@ -21,9 +21,10 @@ unchanged, just far slower.
 1. Paste the code below into a notebook set to GPU P100. Run it once.
 2. The first run is a **3-minute check** that the pipeline can learn on real data
    (it trains on 256 windows, no submission, takes ~3 min).
-3. If the printed result shows `primary top1` near 1.0, flip the switch
+3. If the printed result shows `primary top1` printed above 0.9, flip the switch
    `GATE_ONLY = False` at the top of the cell and press Run again. That is the
-   full training run (hours), which writes `submission_deep.csv`.
+   full training run (hours), which writes `submission_deep.csv` and calls
+   `submit.py` with `--prior-tau 0.5`.
 4. Download it and submit on the competition page.
 
 ```python
@@ -75,7 +76,7 @@ if comp_inputs and os.listdir(comp_inputs[0]):
 else:
     os.environ["MIMIR_DATA_ROOT"] = "/kaggle/tmp"
 os.environ["CACHE_WINDOWS"] = "1"
-os.environ["LIBRI_CACHE_MEMORY_LIMIT_BYTES"] = "24000000000"
+os.environ["LIBRI_CACHE_MEMORY_LIMIT_BYTES"] = "24000000000"   # 24 GiB cache
 
 # ---- 4. Run: gate (3 min) or full training (hours) ----------------------------
 cmd = ["kaggle_run.py", "--overfit", "256", "--no-submit"] if GATE_ONLY else [
@@ -84,10 +85,6 @@ cmd = ["kaggle_run.py", "--overfit", "256", "--no-submit"] if GATE_ONLY else [
     "--limit", "20000",
     "--epochs", "90",
     "--patience", "18",
-    "--pool", "attn",
-    "--loss", "ce",
-    "--class-weights", "none",
-    "--no-balanced-sampling",
     "--submission", "/kaggle/working/submission_deep.csv"]
 rc = subprocess.run([sys.executable, "-u"] + cmd, cwd=REPO, check=False).returncode
 if rc != 0:

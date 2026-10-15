@@ -26,6 +26,8 @@ def build_model_from_checkpoint(ckpt: dict):
             n_channels=meta["n_channels"],
             n_primary_classes=meta["n_primary_classes"],
             n_moses_classes=meta["n_moses_classes"],
+            f1=hp.get("f1", 16),
+            f2=hp.get("f2", 128),
             dropout=hp.get("dropout", 0.25),
         )
     else:

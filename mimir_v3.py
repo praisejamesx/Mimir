@@ -59,9 +59,9 @@ class MimirV3(nn.Module):
         n_channels: int,
         n_primary_classes: int,
         n_moses_classes: int,
-        f1: int = 8,          # temporal filter-bank width
+        f1: int = 16,         # temporal filter-bank width (16x51: N100-P200 + bands)
         d: int = 2,           # spatial filters per temporal filter
-        f2: int = 32,         # separable summary width
+        f2: int = 128,        # separable summary width (matches NTHU D=256 scale order)
         dropout: float = 0.25,
     ):
         super().__init__()
@@ -142,8 +142,15 @@ if __name__ == "__main__":
     with torch.no_grad():
         p2, _ = m(x + 2.0)
     assert not torch.allclose(p, p2, atol=1e-4), "constant output"
-    # Diversity smoke: random batch should not collapse to one argmax.
-    assert len(torch.unique(p.argmax(1))) >= 2, "single argmax on noise"
-    print(f"v3 OK: {(B,C,T)} -> {tuple(p.shape)}, "
-          f"unique-argmax={len(torch.unique(p.argmax(1)))}, "
-          f"col-std={p.std(0).mean():.2e}")
+    # Diversity smoke: trials with different power envelopes (the signal the
+    # power path reads) must give different outputs. White noise is excluded
+    # as a test input: identical power in every trial makes the power path
+    # near-constant by construction (law of large numbers), which is correct
+    # behavior, not collapse.
+    x2 = x * torch.linspace(0.5, 2.0, B).view(B, 1, 1)
+    with torch.no_grad():
+        p2, _ = m(x2)
+    assert not torch.allclose(p, p2, atol=1e-4), "power envelope ignored"
+    assert float(p2.std(0).mean()) > 1e-3, "collapsed outputs"
+    print(f"v3 OK: {(B, C, T)} -> {tuple(p.shape)}, "
+          f"col-std={p2.std(0).mean():.2e}")

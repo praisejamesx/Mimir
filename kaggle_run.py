@@ -81,6 +81,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clip-grad", type=float, default=train_mod.CLIP_GRAD)
     p.add_argument("--no-balanced-sampling", dest="balanced_sampling",
                    action="store_false", default=train_mod.BALANCED_SAMPLING)
+    p.add_argument("--balanced-sampling", dest="balanced_sampling",
+                   action="store_true",
+                   help="oversample rare words (Zipfian prior fix)")
+    p.add_argument("--f1", type=int, default=16)
+    p.add_argument("--f2", type=int, default=128)
     p.add_argument("--model", choices=["v1", "v3"], default=train_mod.MODEL)
     p.add_argument("--moses-weight", type=float, default=train_mod.MOSES_WEIGHT)
     p.add_argument("--overfit", type=int, default=0,
@@ -231,6 +236,8 @@ def run_training(plan: dict, args) -> None:
         sys.argv += ["--model", args.model]
     if hasattr(train_mod, "MOSES_WEIGHT"):
         sys.argv += ["--moses-weight", str(args.moses_weight)]
+    if hasattr(train_mod, "MODEL"):
+        sys.argv += ["--f1", str(args.f1), "--f2", str(args.f2)]
     if not args.balanced_sampling:
         sys.argv += ["--no-balanced-sampling"]
     if args.lr is not None:
@@ -291,7 +298,8 @@ def main() -> None:
             "--dropout", str(args.dropout),
         ]
         if hasattr(train_mod, "MODEL"):
-            sys.argv += ["--model", args.model]
+            sys.argv += ["--model", args.model, "--f1", str(args.f1),
+                         "--f2", str(args.f2)]
         train_mod.main()
         return
 

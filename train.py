@@ -238,6 +238,10 @@ def main(argv=None):
                         help="Auxiliary moses head weight (default: 0.2)")
     parser.add_argument("--d-model", type=int, default=D_MODEL)
     parser.add_argument("--tcn-layers", type=int, default=TCN_LAYERS)
+    parser.add_argument("--f1", type=int, default=16,
+                        help="v3 temporal filter-bank width")
+    parser.add_argument("--f2", type=int, default=128,
+                        help="v3 separable summary width")
     parser.add_argument("--dropout", type=float, default=DROPOUT)
     parser.add_argument("--augment", dest="augment", action="store_true", default=AUGMENT)
     parser.add_argument("--no-augment", dest="augment", action="store_false")
@@ -265,6 +269,8 @@ def main(argv=None):
     hp = {
         "model": args.model,
         "moses_weight": args.moses_weight,
+        "f1": args.f1,
+        "f2": args.f2,
         "d_model": args.d_model,
         "tcn_layers": args.tcn_layers,
         "dropout": args.dropout,
@@ -455,7 +461,9 @@ def make_model(meta, adj, hp: dict = None):
             n_channels=meta.n_channels,
             n_primary_classes=meta.n_primary_classes,
             n_moses_classes=meta.n_moses_classes,
-            dropout=hp.get("dropout", DROPOUT),
+            f1=hp.get("f1", 16),
+            f2=hp.get("f2", 128),
+            dropout=hp.get("dropout", 0.25),
         )
     from mimir_model import Mimir
     return Mimir(

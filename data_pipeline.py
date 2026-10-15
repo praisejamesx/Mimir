@@ -95,6 +95,12 @@ LIBRI_CLIP_BOUNDARY = 10.0                 # pnpl StandardizationMixin default
 # Validation holdout of the training split.
 VAL_FRACTION = 0.1
 LIBRI_SEED = 1337
+# Hold out WHOLE RUNS (not random windows). Random 90/10 windows from the same
+# runs leak session/run artifacts into val (same head position, same story,
+# adjacent windows) -- and the reference benchmark itself uses day-separated
+# splits. Grouped val is strictly more honest; expect val to read lower than
+# the old leaky split even when the model is better.
+VAL_BY_RUN = True
 
 # MNE local smoke run split (stratified by class).
 MNE_VAL_FRACTION = 0.15
@@ -798,11 +804,41 @@ def _make_splits(train_ds, val_ds, batch_size: int, collate_fn=None,
     return loader, val_loader
 
 
+def _run_grouped_split(keep: list[int], samples, val_fraction: float = VAL_FRACTION,
+                       seed: int = LIBRI_SEED) -> tuple[list[int], list[int]]:
+    """Split kept window indices by whole recording runs.
+
+    Groups by the (session, task, run) record fields so validation runs are
+    disjoint from training runs (no shared head position / story / adjacent
+    windows). Accumulates whole runs until the val window quota is met.
+    """
+    groups: dict[tuple, list[int]] = {}
+    for idx in keep:
+        s = samples[idx]
+        groups.setdefault((s[1], s[2], s[3]), []).append(idx)
+    gkeys = sorted(groups, key=repr)
+    rng = torch.Generator().manual_seed(seed + 7)
+    perm = torch.randperm(len(gkeys), generator=rng).tolist()
+    n_val = max(1, int(round(len(keep) * val_fraction)))
+    val_idx: list[int] = []
+    for p in perm:
+        if len(val_idx) >= n_val and val_idx:
+            break
+        val_idx += groups[gkeys[p]]
+    valset = set(val_idx)
+    train_idx = [i for i in keep if i not in valset]
+    print(f"[data_pipeline] run-grouped split: {len(gkeys)} runs, "
+          f"val takes {len(val_idx)} windows "
+          f"({len(val_idx) / max(1, len(keep)) * 100:.1f}%)")
+    return train_idx, val_idx
+
+
 def build(
     data_path: Optional[Path] = None,
     batch_size: Optional[int] = None,
     max_windows: Optional[int] = None,
     balanced_sampling: bool = False,
+    val_by_run: bool = VAL_BY_RUN,
 ) -> tuple:
     """Dispatcher: same (dataset, adj, meta, loader) tuple from either source.
 
@@ -812,6 +848,7 @@ def build(
 
     max_windows caps the vocab-filtered window count (probe runs).
     balanced_sampling oversamples rare words on the train split only.
+    val_by_run holds out whole runs for validation (no session leakage).
     """
     if USE_REAL_DATA:
         return build_libribrain100(
@@ -819,6 +856,7 @@ def build(
             batch_size=batch_size or LIBRI_BATCH_SIZE,
             max_windows=max_windows,
             balanced_sampling=balanced_sampling,
+            val_by_run=val_by_run,
         )
     return build_mne_sample(data_path=data_path, batch_size=batch_size or 8)
 
@@ -850,6 +888,7 @@ def build_libribrain100(
     batch_size: int = LIBRI_BATCH_SIZE,
     max_windows: Optional[int] = None,
     balanced_sampling: bool = False,
+    val_by_run: bool = VAL_BY_RUN,
 ) -> tuple:
     """LibriBrain100 (Deep Track, subject 0) -> the 4-tuple.
 
@@ -927,13 +966,17 @@ def build_libribrain100(
         print(f"[data_pipeline] probe limit: seeded-shuffled subsample of "
               f"{max_windows} windows")
 
-    # Seeded 90/10 split on the index space; both wrapper datasets share the
-    # one pnpl dataset (one standardization pass + file cache).
-    rng = torch.Generator().manual_seed(LIBRI_SEED)
-    perm = torch.randperm(len(keep), generator=rng).tolist()
-    n_val = max(1, int(round(len(keep) * VAL_FRACTION)))
-    train_idx = [keep[p] for p in perm[n_val:]]
-    val_idx = [keep[p] for p in perm[:n_val]]
+    # Split on the index space; both wrapper datasets share the one pnpl
+    # dataset (one standardization pass + file cache). Run-grouped by
+    # default (no session leakage); plain seeded shuffle only on request.
+    if val_by_run:
+        train_idx, val_idx = _run_grouped_split(keep, ds.samples)
+    else:
+        rng = torch.Generator().manual_seed(LIBRI_SEED)
+        perm = torch.randperm(len(keep), generator=rng).tolist()
+        n_val = max(1, int(round(len(keep) * VAL_FRACTION)))
+        train_idx = [keep[p] for p in perm[n_val:]]
+        val_idx = [keep[p] for p in perm[:n_val]]
 
     # RAM cache: preload the pre-standardized windows once, then never touch
     # the H5 files again (the Kaggle epoch bottleneck). Guard is based on the

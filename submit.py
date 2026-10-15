@@ -82,8 +82,32 @@ def main() -> None:
 
     # ---- 1. Model ------------------------------------------------------------
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    retrieval = "centroids_primary" in ckpt
-    if retrieval:
+    retrieval = "t5_primary" in ckpt or "centroids_primary" in ckpt
+    if "t5_primary" in ckpt:
+        from retrieval import ProjectionHead
+        from mimir_v4 import MimirV4
+        hp = ckpt["hyperparams"]
+        encoder = MimirV4(
+            n_channels=ckpt["meta"]["n_channels"],
+            n_primary_classes=ckpt["meta"]["n_primary_classes"],
+            n_moses_classes=ckpt["meta"]["n_moses_classes"],
+            f1=hp.get("f1", 16),
+            f2=hp.get("f2", 128),
+            dropout=hp.get("dropout", 0.25),
+        )
+        encoder.load_state_dict(ckpt["model_state"])
+        proj = ProjectionHead(encoder.feat_dim, ckpt["t5_primary"].shape[1])
+        proj.load_state_dict(ckpt["proj_state"])
+        encoder.to(device).eval()
+        proj.to(device).eval()
+        cent_p = torch.as_tensor(ckpt["t5_primary"]).float().to(device)
+        cent_m = torch.as_tensor(ckpt["t5_moses"]).float().to(device)
+        submit_tau = float(ckpt.get("submit_tau", 0.2))
+        model = None
+        print(f"[submit] t5-retrieval checkpoint: epoch {ckpt.get('epoch')} "
+              f"val_bal_Top10 {ckpt.get('val_bal_top10', float('nan')):.3f} "
+              f"tau={submit_tau}")
+    elif retrieval:
         from retrieval import ProjectionHead
         from mimir_v3 import MimirV3
         hp = ckpt["hyperparams"]

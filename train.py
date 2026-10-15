@@ -37,12 +37,13 @@ POOL = "attn"
 LOSS = "ce"              # "focal" or "ce"
 GAMMA = 2.0
 CLASS_WEIGHTS = "none"   # "sqrt-inv" or "none" (empirically harmful on real data)
-MODEL = "v3"             # "v3" (spectral-spatial successor) or "v1" (legacy GCN+TCN)
+MODEL = "v4"             # "v4" (physics front end) / "v3" / "v1" (legacy)
 MOSES_WEIGHT = 0.2       # aux head weight; v1 used equal sum (1.0) which let
                          # moses (0.6) drag the backbone while primary (2.4)
                          # stayed at chance
-OBJECTIVE = "supcon"     # "supcon" (matching; no prior to retreat to) or
-                         # "ce" (50-way guessing; floored at chance x4)
+OBJECTIVE = "siglip"     # "siglip" (fixed T5 targets; every trial always has
+                         # its positives -- kills the missing-pair collapse) /
+                         # "supcon" / "ce" (both floored at chance)
 TEMPERATURE = 0.1        # contrastive temperature (Khosla et al. 2020)
 LABEL_SMOOTHING = 0.1
 
@@ -235,10 +236,11 @@ def main(argv=None):
                         help="Per-head sqrt-inverse-frequency class weighting")
     parser.add_argument("--pool", choices=["mean", "attn"], default=POOL,
                         help="Classifier head pooling (v1 only; v3 uses mean+logpower)")
-    parser.add_argument("--model", choices=["v1", "v3"], default=MODEL,
-                        help="Backbone (default: v3 spectral-spatial successor)")
-    parser.add_argument("--objective", choices=["ce", "supcon"], default=OBJECTIVE,
-                        help="Training objective (default: supcon matching)")
+    parser.add_argument("--model", choices=["v1", "v3", "v4"], default=MODEL,
+                        help="Backbone (default: v4 physics front end)")
+    parser.add_argument("--objective", choices=["ce", "supcon", "siglip"],
+                        default=OBJECTIVE,
+                        help="Training objective (default: siglip to T5 targets)")
     parser.add_argument("--temperature", type=float, default=TEMPERATURE,
                         help="Contrastive temperature (default: 0.1)")
     parser.add_argument("--moses-weight", type=float, default=MOSES_WEIGHT,
@@ -255,6 +257,9 @@ def main(argv=None):
     parser.add_argument("--balanced-sampling", dest="balanced_sampling",
                         action="store_true", default=BALANCED_SAMPLING)
     parser.add_argument("--no-balanced-sampling", dest="balanced_sampling", action="store_false")
+    parser.add_argument("--val-by-run", dest="val_by_run",
+                        action="store_true", default=True)
+    parser.add_argument("--no-val-by-run", dest="val_by_run", action="store_false")
     parser.add_argument("--overfit", type=int, default=0,
                         help="Diagnostic: train on N fixed windows (no augment/weights)")
     parser.add_argument("--seed", type=int, default=SEED)
@@ -275,6 +280,7 @@ def main(argv=None):
 
     hp = {
         "model": args.model,
+        "objective": args.objective,
         "moses_weight": args.moses_weight,
         "f1": args.f1,
         "f2": args.f2,
@@ -291,7 +297,9 @@ def main(argv=None):
     if args.overfit > 0:
         best_top10, final_epoch = _run_overfit(args, dev, hp)
     elif args.epochs > 1 or args.limit is not None:
-        if args.objective == "supcon":
+        if args.objective == "siglip":
+            best_top10, final_epoch = _run_full_siglip(args, dev, hp, checkpoint_path)
+        elif args.objective == "supcon":
             best_top10, final_epoch = _run_full_supcon(args, dev, hp, checkpoint_path)
         else:
             best_top10, final_epoch = _run_full(args, dev, hp, checkpoint_path)
@@ -335,6 +343,7 @@ def _run_full(args, dev, hp, checkpoint_path):
         batch_size=args.batch_size,
         max_windows=args.limit,
         balanced_sampling=args.balanced_sampling,
+        val_by_run=args.val_by_run,
     )
     val_loader = getattr(dataset, "val_loader", None)
     print(f"[train.main] data ready: {len(dataset)} train windows, "
@@ -439,6 +448,7 @@ def _run_full_supcon(args, dev, hp, checkpoint_path):
         batch_size=args.batch_size,
         max_windows=args.limit,
         balanced_sampling=args.balanced_sampling,
+        val_by_run=args.val_by_run,
     )
     val_loader = getattr(dataset, "val_loader", None)
     diag_loader = val_loader if val_loader is not None else loader
@@ -538,6 +548,157 @@ def _run_full_supcon(args, dev, hp, checkpoint_path):
     return best_top10, final_epoch
 
 
+def _run_full_siglip(args, dev, hp, checkpoint_path):
+    """SigLIP training to fixed T5 word targets (d'Ascoli/Jayalath recipe).
+
+    Requires model=v4 (uses .encode; v3 also satisfies it, v1 does not).
+    One augmented view per trial (no doubling -- the candidate set is the
+    fixed 50-word vocabulary, so positives are always present regardless of
+    batch composition). Eval reuses retrieval_top10 with the FIXED T5
+    matrices (no per-epoch centroid rebuild). Checkpoint and early stopping
+    follow PRIMARY retrieval BalAcc@10.
+
+    If T5 targets cannot be built (no transformers/network), falls back to
+    the supcon path rather than crashing the run.
+    """
+    if hp.get("model", MODEL) not in ("v3", "v4"):
+        raise ValueError("objective=siglip requires --model v3 or v4 (needs .encode)")
+    import data_pipeline
+    from retrieval import (ProjectionHead, siglip_loss, retrieval_top10,
+                           SUBMIT_TAU)
+    data_pipeline.USE_REAL_DATA = True
+    print(f"[train.main] SIGLIP training: {args.epochs} epochs, limit={args.limit}, "
+          f"batch_size={args.batch_size}, tau={args.temperature}, "
+          f"moses_weight={args.moses_weight}")
+
+    dataset, adj, meta, loader = data_pipeline.build(
+        data_path=Path(args.data_root) if args.data_root else None,
+        batch_size=args.batch_size,
+        max_windows=args.limit,
+        balanced_sampling=args.balanced_sampling,
+        val_by_run=args.val_by_run,
+    )
+    val_loader = getattr(dataset, "val_loader", None)
+    diag_loader = val_loader if val_loader is not None else loader
+
+    from pnpl.competition import load_vocabulary
+    from data_pipeline import normalize_word
+    from t5_targets import ensure_t5_vocab, T5_DIM
+    pv = [normalize_word(w) for w in load_vocabulary("primary")]
+    pm = [normalize_word(w) for w in load_vocabulary("secondary")]
+    assert list(pv) == list(meta.class_names) and len(pv) == 50 and len(pm) == 50, \
+        "vocab order mismatch between pnpl and pipeline meta"
+    try:
+        tp_cpu, tm_cpu = ensure_t5_vocab(pv, pm)
+    except RuntimeError as exc:
+        print(f"[train.main] {exc}")
+        print("[train.main] falling back to supcon objective")
+        return _run_full_supcon(args, dev, hp, checkpoint_path)
+    tp, tm = tp_cpu.to(dev), tm_cpu.to(dev)
+
+    encoder = make_model(meta, adj, hp).to(dev)
+    proj = ProjectionHead(encoder.feat_dim, T5_DIM).to(dev)
+    augment = make_augment()
+    params = list(encoder.parameters()) + list(proj.parameters())
+    optimizer = torch.optim.AdamW(params, lr=args.lr or CLOUD_LR,
+                                  weight_decay=args.weight_decay)
+    scheduler = get_scheduler(
+        optimizer, epochs=args.epochs,
+        warmup_epochs=max(1, min(args.warmup_epochs, max(1, args.epochs // 4))),
+        lr=args.lr or CLOUD_LR,
+    )
+    tau = args.temperature
+
+    def pm_targets(y: torch.Tensor, n: int):
+        v = y != -100
+        t = torch.full((int(v.sum()), n), -1.0, device=dev)
+        t[torch.arange(int(v.sum()), device=dev), y[v].long()] = 1.0
+        return t, v
+
+    best_top10, patience_counter, final_epoch = 0.0, 0, 0
+    print(f"[train.main] Starting siglip: {args.epochs} epochs, patience={args.patience}")
+    for epoch in range(1, args.epochs + 1):
+        final_epoch = epoch
+        print(f"\n=== Epoch {epoch}/{args.epochs} ===")
+        encoder.train()
+        proj.train()
+        augment.train()
+        running, n_batches = 0.0, 0
+        optimizer.zero_grad(set_to_none=True)
+        for i, (x, y_p, y_m) in enumerate(loader):
+            x, y_p, y_m = x.to(dev), y_p.to(dev), y_m.to(dev)
+            z = proj(encoder.encode(augment(x)))
+            sims_p = (z @ tp.T) / tau
+            sims_m = (z @ tm.T) / tau
+            tgt_p, vp = pm_targets(y_p, sims_p.shape[1])
+            tgt_m, vm = pm_targets(y_m, sims_m.shape[1])
+            loss = torch.zeros((), device=dev)
+            if bool(vp.any()):
+                loss = loss + siglip_loss(sims_p[vp], tgt_p)
+            if bool(vm.any()):
+                loss = loss + args.moses_weight * siglip_loss(sims_m[vm], tgt_m)
+            (loss / max(1, int(args.accum_steps))).backward()
+            if (i + 1) % max(1, int(args.accum_steps)) == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    params, max_norm=args.clip_grad)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                grad_norm = torch.zeros((), device=dev)
+            running += float(loss.detach())
+            n_batches += 1
+            if i < MAX_PRINT_BATCHES:
+                print(f"  batch {i}: siglip={float(loss.detach()):.4f}  "
+                      f"grad_norm={float(grad_norm):.4e}")
+            elif (i + 1) % PROGRESS_EVERY == 0:
+                print(f"  epoch {epoch} batch {i + 1}: "
+                      f"siglip={float(loss.detach()):.4f}")
+            del x, y_p, y_m, z, sims_p, sims_m, loss
+            if (i + 1) % 10 == 0:
+                gc.collect()
+        if n_batches % max(1, int(args.accum_steps)) != 0:
+            torch.nn.utils.clip_grad_norm_(params, max_norm=args.clip_grad)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        print(f"[train.main] epoch {epoch} train siglip={running / max(n_batches, 1):.4f}")
+
+        d_p = retrieval_top10(encoder, proj, tp, diag_loader, 0, dev)
+        d_m = retrieval_top10(encoder, proj, tm, diag_loader, 1, dev)
+        current_top10 = d_p["balanced_top10"]
+        print(f"[train.main] Epoch {epoch} retrieval: "
+              f"primary top10={d_p['balanced_top10']:.4f} "
+              f"top1={d_p['balanced_top1']:.4f} | "
+              f"moses top10={d_m['balanced_top10']:.4f} "
+              f"top1={d_m['balanced_top1']:.4f}")
+
+        if scheduler is not None:
+            scheduler.step()
+
+        if epoch == 1 or current_top10 > best_top10:
+            best_top10 = max(best_top10, current_top10)
+            _save_checkpoint(
+                checkpoint_path, encoder, optimizer, meta, adj, hp,
+                epoch, best_top10,
+                extras={"proj_state": {k: v.detach().cpu()
+                                       for k, v in proj.state_dict().items()},
+                        "t5_primary": tp_cpu, "t5_moses": tm_cpu,
+                        "temperature": tau,
+                        "submit_tau": SUBMIT_TAU})
+            print(f"[train.main] Checkpoint saved to {checkpoint_path} "
+                  f"(primary retrieval top-10: {best_top10:.4f})")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"[train.main] No improvement. Patience counter: "
+                  f"{patience_counter}/{args.patience}")
+
+        if patience_counter >= args.patience:
+            print(f"[train.main] Early stopping triggered after {epoch} epochs")
+            break
+
+    return best_top10, final_epoch
+
+
 def _run_overfit(args, dev, hp):
     """Diagnostic: can the pipeline memorise a tiny fixed subset?
 
@@ -588,10 +749,21 @@ def _run_overfit(args, dev, hp):
 def make_model(meta, adj, hp: dict = None):
     """Build backbone from PipelineMeta + hyperparameters.
 
-    model="v3" (default): spectral-spatial successor (mimir_v3.py).
+    model="v4" (default): physics front end (mimir_v4.py).
+    model="v3": spectral-spatial successor (mimir_v3.py).
     model="v1": legacy GCN+TCN (mimir_model.py).
     """
     hp = hp or {}
+    if hp.get("model", MODEL) == "v4":
+        from mimir_v4 import MimirV4
+        return MimirV4(
+            n_channels=meta.n_channels,
+            n_primary_classes=meta.n_primary_classes,
+            n_moses_classes=meta.n_moses_classes,
+            f1=hp.get("f1", 16),
+            f2=hp.get("f2", 128),
+            dropout=hp.get("dropout", 0.25),
+        )
     if hp.get("model", MODEL) == "v3":
         from mimir_v3 import MimirV3
         return MimirV3(

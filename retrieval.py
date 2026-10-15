@@ -31,6 +31,19 @@ TEMPERATURE = 0.1
 SUBMIT_TAU = 0.2
 
 
+def siglip_loss(sims: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """SigLIP-style loss (Zhai et al. 2023) over a fixed candidate matrix.
+
+    sims: (B, C) cosine similarities / tau. targets: (B, C) in {+1, -1};
+    rows whose trial label is invalid (-100) must be pre-excluded by the
+    caller (mask and mean outside). Unlike SupCon, the candidate set is FIXED
+    (the vocabulary), so every trial always has its positives present -- no
+    dependence on batch composition. This structurally kills the missing-pair
+    failure (batch-32 SupCon collapsed with centroids at 0.996 pairwise cos).
+    """
+    return F.logsigmoid(sims * targets).mean().neg()
+
+
 class ProjectionHead(nn.Module):
     """Linear projection to L2-normalized retrieval embeddings."""
 

@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--f2", type=int, default=128)
     p.add_argument("--model", choices=["v1", "v3"], default=train_mod.MODEL)
     p.add_argument("--moses-weight", type=float, default=train_mod.MOSES_WEIGHT)
-    p.add_argument("--objective", choices=["ce", "supcon"],
+    p.add_argument("--objective", choices=["ce", "supcon", "siglip"],
                    default=getattr(train_mod, "OBJECTIVE", "ce"))
     p.add_argument("--temperature", type=float,
                    default=getattr(train_mod, "TEMPERATURE", 0.1))
@@ -313,8 +313,9 @@ def main() -> None:
     try:
         sec = measure_sec_per_window(args, device)
         if getattr(args, "objective", "ce") == "supcon":
-            # Retrieval trains two augmented views per trial plus a centroid
+            # Supcon trains two augmented views per trial plus a centroid
             # forward pass over train each eval epoch: ~2.5x CE epoch cost.
+            # Siglip needs one view and fixed targets: same cost as CE.
             sec = sec * 2.5
             print(f"[kaggle_run] supcon objective: timing x2.5 "
                   f"(two views + centroid eval)")

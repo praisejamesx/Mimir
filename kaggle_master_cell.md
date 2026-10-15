@@ -5,8 +5,9 @@ Copy the single code cell below into a new Kaggle notebook and run it.
 **Two ways to bring the code in:**
 
 1. **Upload (recommended):** in the notebook, drag
-   `data_pipeline.py`, `mimir_model.py`, `train.py`, `submit.py`,
-   `kaggle_run.py` into the file panel so they end up under
+   `data_pipeline.py`, `mimir_model.py`, `mimir_v3.py`, `mimir_v4.py`,
+   `retrieval.py`, `t5_targets.py`, `train.py`, `submit.py`,
+   `kaggle_run.py` (9 files) into the file panel so they end up under
    `/kaggle/working/Mimir/`. The cell detects them, skips git entirely, and
    runs from your uploaded copy.
 2. **Repository clone:** add a Kaggle Secret named `GH_TOKEN` (a GitHub
@@ -33,19 +34,23 @@ import os, subprocess, sys, glob
 GATE_ONLY = True
 
 # ---- 1. Dependencies ---------------------------------------------------------
-for pkg in ("mne", "pnpl"):
+# NOTE: re-upload all 8 files (t5_targets.py and mimir_v4.py are new).
+for pkg, pip_name in (("mne", "mne"), ("pnpl", "pnpl"),
+                      ("transformers", "transformers"),
+                      ("sentencepiece", "sentencepiece")):
     try:
         __import__(pkg)
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                        "pnpl", "mne"], check=True)
+                        pip_name], check=True)
 
 # ---- 2. Source (uploaded files take priority; git only as a fallback) --------
 REPO = "/kaggle/working/Mimir"
 have_files = os.path.isdir(REPO) and os.path.exists(os.path.join(REPO, "kaggle_run.py"))
 if have_files:
     print("[master cell] using uploaded Mimir files in /kaggle/working/Mimir")
-    for name in ("data_pipeline.py", "mimir_model.py", "train.py",
+    for name in ("data_pipeline.py", "mimir_model.py", "mimir_v3.py",
+                 "mimir_v4.py", "retrieval.py", "t5_targets.py", "train.py",
                  "submit.py", "kaggle_run.py"):
         src = f"/kaggle/working/{name}"
         if os.path.exists(src):
@@ -92,7 +97,7 @@ cmd = ["kaggle_run.py", "--overfit", "256", "--no-submit"] if GATE_ONLY else [
     "--dropout", "0.25",
     "--f1", "16",
     "--f2", "128",
-    "--objective", "supcon",
+    "--objective", "siglip",
     "--submission", "/kaggle/working/submission_deep.csv"]
 rc = subprocess.run([sys.executable, "-u"] + cmd, cwd=REPO, check=False).returncode
 if rc != 0:

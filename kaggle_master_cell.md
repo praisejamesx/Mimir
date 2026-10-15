@@ -106,3 +106,93 @@ else:
     print("[master cell] the notebook's right-hand file panel / Output tab and")
     print("[master cell] submit it on the competition page.")
 ```
+
+---
+
+## Audit cell (label-mapping check) — fully self-contained
+
+Paste into ANY notebook (fresh or not), press Run once, walk away. Installs
+its own packages, pulls the repo code, uses mounted data if present else
+downloads it (~20GB, unattended). Takes ~2 min with mounted data, longer if
+downloading. Paste the whole output back.
+
+```python
+import os, subprocess, sys, glob
+from collections import Counter
+
+# ---- 1. Packages ----
+for pkg in ("mne", "pnpl"):
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"[audit] installing {pkg} ...", flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "pnpl", "mne"], check=True)
+
+# ---- 2. Repo code (same word-reading training uses) ----
+REPO = "/kaggle/working/Mimir"
+if not (os.path.isdir(REPO) and os.path.exists(os.path.join(REPO, "data_pipeline.py"))):
+    print("[audit] cloning repo ...", flush=True)
+    subprocess.run(["git", "clone",
+                    "https://github.com/praisejamesx/Mimir.git", REPO], check=True)
+sys.path.insert(0, REPO)
+from data_pipeline import normalize_word, _h5_channel_names
+
+# ---- 3. Data: mounted if present, else download (unattended) ----
+roots = [r for r in glob.glob("/kaggle/input/**/libribrain100", recursive=True)
+         if os.path.isdir(r) and os.listdir(r)]
+if roots:
+    DATA = roots[0]
+    print("[audit] using mounted data:", DATA, flush=True)
+else:
+    DATA = "/kaggle/tmp/libribrain100"
+    print("[audit] no mounted data; downloading to", DATA, flush=True)
+    print("[audit] this is ~20GB and takes a while; nothing needed from you.", flush=True)
+
+# ---- 4. Dataset (downloads on first use if DATA is empty) ----
+from pnpl.datasets import LibriBrain100
+from pnpl.datasets.libribrain100.constants import DEFAULT_PREPROCESSING_STR
+from pnpl.tasks import WordClassification
+ds = LibriBrain100(data_path=DATA, task=WordClassification(tmin=0.0, tmax=1.0),
+                   partition="train", subjects="deep",
+                   preprocessing_str=DEFAULT_PREPROCESSING_STR,
+                   standardize=True, download=True, preload_h5=False)
+print("[audit] loaded:", len(ds.samples), "samples,", len(ds.records),
+      "runs,", ds.n_channels, "ch x", ds.n_times, "samples", flush=True)
+
+# ---- 5. Schema: what is field #6? ----
+s0 = ds.samples[0]
+print("record type:", type(s0), "n fields:", len(s0), flush=True)
+for i, f in enumerate(list(s0)[:8]):
+    print(f"  field[{i}] =", repr(f)[:120], flush=True)
+for s in ds.samples[:10]:
+    print("  field[5] =", repr(s[5])[:40], "->", repr(normalize_word(s[5])), flush=True)
+
+# ---- 6. Vocabularies ----
+from pnpl.competition import load_vocabulary
+pv, mv = list(load_vocabulary("primary")), list(load_vocabulary("secondary"))
+print("primary:", len(pv), list(pv)[:5], flush=True)
+print("moses:", len(mv), list(mv)[:5], flush=True)
+
+# ---- 7. Coverage over first 50k samples ----
+w2p, w2m, vu = set(pv), set(mv), set(pv) | set(mv)
+cnt, npp, nmm, neither = Counter(), 0, 0, 0
+for s in ds.samples[:50000]:
+    w = normalize_word(s[5])
+    if w is None or w not in vu:
+        neither += 1
+        continue
+    cnt[w] += 1
+    npp += w in w2p
+    nmm += w in w2m
+print("top-10 words:", cnt.most_common(10), flush=True)
+print(f"valid primary: {npp}, valid moses: {nmm}, dropped: {neither}", flush=True)
+
+# ---- 8. Channel names readable? (training log showed a fallback warning) ----
+try:
+    names = _h5_channel_names(ds.get_h5_dataset(ds.run_keys[0]))
+    print(f"H5 channel_names: {len(names)} read, e.g. {names[:3]}", flush=True)
+except Exception as exc:
+    print(f"H5 channel_names UNREADABLE ({type(exc).__name__}: {exc})", flush=True)
+print("[audit] DONE. Paste everything above back.", flush=True)
+```

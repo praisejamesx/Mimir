@@ -41,6 +41,9 @@ MODEL = "v3"             # "v3" (spectral-spatial successor) or "v1" (legacy GCN
 MOSES_WEIGHT = 0.2       # aux head weight; v1 used equal sum (1.0) which let
                          # moses (0.6) drag the backbone while primary (2.4)
                          # stayed at chance
+OBJECTIVE = "supcon"     # "supcon" (matching; no prior to retreat to) or
+                         # "ce" (50-way guessing; floored at chance x4)
+TEMPERATURE = 0.1        # contrastive temperature (Khosla et al. 2020)
 LABEL_SMOOTHING = 0.1
 
 # Optimization.
@@ -234,6 +237,10 @@ def main(argv=None):
                         help="Classifier head pooling (v1 only; v3 uses mean+logpower)")
     parser.add_argument("--model", choices=["v1", "v3"], default=MODEL,
                         help="Backbone (default: v3 spectral-spatial successor)")
+    parser.add_argument("--objective", choices=["ce", "supcon"], default=OBJECTIVE,
+                        help="Training objective (default: supcon matching)")
+    parser.add_argument("--temperature", type=float, default=TEMPERATURE,
+                        help="Contrastive temperature (default: 0.1)")
     parser.add_argument("--moses-weight", type=float, default=MOSES_WEIGHT,
                         help="Auxiliary moses head weight (default: 0.2)")
     parser.add_argument("--d-model", type=int, default=D_MODEL)
@@ -284,7 +291,10 @@ def main(argv=None):
     if args.overfit > 0:
         best_top10, final_epoch = _run_overfit(args, dev, hp)
     elif args.epochs > 1 or args.limit is not None:
-        best_top10, final_epoch = _run_full(args, dev, hp, checkpoint_path)
+        if args.objective == "supcon":
+            best_top10, final_epoch = _run_full_supcon(args, dev, hp, checkpoint_path)
+        else:
+            best_top10, final_epoch = _run_full(args, dev, hp, checkpoint_path)
     else:
         print(f"[train.main] Smoke mode: {args.epochs} epoch(s)")
         best_top10, final_epoch = 0.0, 0
@@ -296,7 +306,8 @@ def main(argv=None):
     return 0
 
 
-def _save_checkpoint(path, model, optimizer, meta, adj, hp, epoch, best_top10):
+def _save_checkpoint(path, model, optimizer, meta, adj, hp, epoch, best_top10,
+                     extras: dict = None):
     ckpt = {
         "epoch": epoch,
         "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
@@ -306,6 +317,9 @@ def _save_checkpoint(path, model, optimizer, meta, adj, hp, epoch, best_top10):
         "adj": adj.detach().cpu() if torch.is_tensor(adj) else adj,
         "val_bal_top10": best_top10,
     }
+    if extras:
+        ckpt.update({k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                     for k, v in extras.items()})
     torch.save(ckpt, str(path))
 
 
@@ -389,6 +403,129 @@ def _run_full(args, dev, hp, checkpoint_path):
         if improved or epoch == 1:
             best_combined = max(best_combined, current_combined)
             patience_counter = 0 if improved else patience_counter
+        else:
+            patience_counter += 1
+            print(f"[train.main] No improvement. Patience counter: "
+                  f"{patience_counter}/{args.patience}")
+
+        if patience_counter >= args.patience:
+            print(f"[train.main] Early stopping triggered after {epoch} epochs")
+            break
+
+    return best_top10, final_epoch
+
+
+def _run_full_supcon(args, dev, hp, checkpoint_path):
+    """Matching-based training: SupCon over two augmented views + retrieval eval.
+
+    Requires model=v3 (needs .encode). One shared projection head, two
+    centroid sets (primary + 0.2-weight moses aux). Early stopping and the
+    checkpoint follow PRIMARY retrieval BalAcc@10 -- the leaderboard metric.
+    Centroids are rebuilt from the train loader every epoch (representation
+    shifts as the encoder learns; stale centroids would mis-score).
+    """
+    if hp.get("model", MODEL) != "v3":
+        raise ValueError("objective=supcon requires --model v3 (needs .encode)")
+    import data_pipeline
+    from retrieval import (ProjectionHead, supcon_loss, build_centroids,
+                           retrieval_top10, SUBMIT_TAU)
+    data_pipeline.USE_REAL_DATA = True
+    print(f"[train.main] SUPCON training: {args.epochs} epochs, limit={args.limit}, "
+          f"batch_size={args.batch_size}, tau={args.temperature}, "
+          f"moses_weight={args.moses_weight}")
+
+    dataset, adj, meta, loader = data_pipeline.build(
+        data_path=Path(args.data_root) if args.data_root else None,
+        batch_size=args.batch_size,
+        max_windows=args.limit,
+        balanced_sampling=args.balanced_sampling,
+    )
+    val_loader = getattr(dataset, "val_loader", None)
+    diag_loader = val_loader if val_loader is not None else loader
+
+    encoder = make_model(meta, adj, hp).to(dev)
+    proj = ProjectionHead(2 * hp.get("f2", 128)).to(dev)
+    augment = make_augment()
+    params = list(encoder.parameters()) + list(proj.parameters())
+    optimizer = torch.optim.AdamW(params, lr=args.lr or CLOUD_LR,
+                                  weight_decay=args.weight_decay)
+    scheduler = get_scheduler(
+        optimizer, epochs=args.epochs,
+        warmup_epochs=max(1, min(args.warmup_epochs, max(1, args.epochs // 4))),
+        lr=args.lr or CLOUD_LR,
+    )
+
+    best_top10, patience_counter, final_epoch = 0.0, 0, 0
+    print(f"[train.main] Starting supcon: {args.epochs} epochs, patience={args.patience}")
+    for epoch in range(1, args.epochs + 1):
+        final_epoch = epoch
+        print(f"\n=== Epoch {epoch}/{args.epochs} ===")
+        encoder.train()
+        proj.train()
+        augment.train()
+        running, n_batches = 0.0, 0
+        optimizer.zero_grad(set_to_none=True)
+        for i, (x, y_p, y_m) in enumerate(loader):
+            x, y_p, y_m = x.to(dev), y_p.to(dev), y_m.to(dev)
+            z = proj(encoder.encode(torch.cat([augment(x), augment(x)], dim=0)))
+            lab_p = torch.cat([y_p, y_p], dim=0)
+            lab_m = torch.cat([y_m, y_m], dim=0)
+            loss = supcon_loss(z, lab_p, args.temperature) + \
+                args.moses_weight * supcon_loss(z, lab_m, args.temperature)
+            (loss / max(1, int(args.accum_steps))).backward()
+            if (i + 1) % max(1, int(args.accum_steps)) == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    params, max_norm=args.clip_grad)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                grad_norm = torch.zeros((), device=dev)
+            running += loss.item()
+            n_batches += 1
+            if i < MAX_PRINT_BATCHES:
+                print(f"  batch {i}: supcon={loss.item():.4f}  "
+                      f"grad_norm={float(grad_norm):.4e}")
+            elif (i + 1) % PROGRESS_EVERY == 0:
+                print(f"  epoch {epoch} batch {i + 1}: supcon={loss.item():.4f}")
+            del x, y_p, y_m, z, lab_p, lab_m, loss
+            if (i + 1) % 10 == 0:
+                gc.collect()
+        if n_batches % max(1, int(args.accum_steps)) != 0:
+            torch.nn.utils.clip_grad_norm_(params, max_norm=args.clip_grad)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        print(f"[train.main] epoch {epoch} train supcon={running / max(n_batches, 1):.4f}")
+
+        cent_p = build_centroids(encoder, proj, loader,
+                                 meta.n_primary_classes, 0, dev)
+        cent_m = build_centroids(encoder, proj, loader,
+                                 meta.n_moses_classes, 1, dev)
+        d_p = retrieval_top10(encoder, proj, cent_p, diag_loader, 0, dev)
+        d_m = retrieval_top10(encoder, proj, cent_m, diag_loader, 1, dev)
+        current_top10 = d_p["balanced_top10"]
+        print(f"[train.main] Epoch {epoch} retrieval: "
+              f"primary top10={d_p['balanced_top10']:.4f} "
+              f"top1={d_p['balanced_top1']:.4f} | "
+              f"moses top10={d_m['balanced_top10']:.4f} "
+              f"top1={d_m['balanced_top1']:.4f}")
+
+        if scheduler is not None:
+            scheduler.step()
+
+        if epoch == 1 or current_top10 > best_top10:
+            best_top10 = max(best_top10, current_top10)
+            _save_checkpoint(
+                checkpoint_path, encoder, optimizer, meta, adj, hp,
+                epoch, best_top10,
+                extras={"proj_state": {k: v.detach().cpu()
+                                       for k, v in proj.state_dict().items()},
+                        "centroids_primary": cent_p.detach().cpu(),
+                        "centroids_moses": cent_m.detach().cpu(),
+                        "temperature": args.temperature,
+                        "submit_tau": SUBMIT_TAU})
+            print(f"[train.main] Checkpoint saved to {checkpoint_path} "
+                  f"(primary retrieval top-10: {best_top10:.4f})")
+            patience_counter = 0
         else:
             patience_counter += 1
             print(f"[train.main] No improvement. Patience counter: "

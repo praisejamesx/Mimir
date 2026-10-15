@@ -88,6 +88,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--f2", type=int, default=128)
     p.add_argument("--model", choices=["v1", "v3"], default=train_mod.MODEL)
     p.add_argument("--moses-weight", type=float, default=train_mod.MOSES_WEIGHT)
+    p.add_argument("--objective", choices=["ce", "supcon"],
+                   default=getattr(train_mod, "OBJECTIVE", "ce"))
+    p.add_argument("--temperature", type=float,
+                   default=getattr(train_mod, "TEMPERATURE", 0.1))
     p.add_argument("--overfit", type=int, default=0,
                    help="diagnostic: train on N fixed windows only, then exit")
     return p.parse_args()
@@ -238,6 +242,9 @@ def run_training(plan: dict, args) -> None:
         sys.argv += ["--moses-weight", str(args.moses_weight)]
     if hasattr(train_mod, "MODEL"):
         sys.argv += ["--f1", str(args.f1), "--f2", str(args.f2)]
+    if hasattr(train_mod, "OBJECTIVE"):
+        sys.argv += ["--objective", args.objective,
+                     "--temperature", str(args.temperature)]
     if not args.balanced_sampling:
         sys.argv += ["--no-balanced-sampling"]
     if args.lr is not None:
@@ -305,6 +312,12 @@ def main() -> None:
 
     try:
         sec = measure_sec_per_window(args, device)
+        if getattr(args, "objective", "ce") == "supcon":
+            # Retrieval trains two augmented views per trial plus a centroid
+            # forward pass over train each eval epoch: ~2.5x CE epoch cost.
+            sec = sec * 2.5
+            print(f"[kaggle_run] supcon objective: timing x2.5 "
+                  f"(two views + centroid eval)")
     except RuntimeError as exc:
         print(f"[kaggle_run] measurement failed on {device}: {exc}")
         if device.type == "cuda":

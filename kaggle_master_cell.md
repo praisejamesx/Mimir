@@ -91,6 +91,7 @@ cmd = ["kaggle_run.py", "--overfit", "256", "--no-submit"] if GATE_ONLY else [
     "--dropout", "0.25",
     "--f1", "16",
     "--f2", "128",
+    "--objective", "supcon",
     "--submission", "/kaggle/working/submission_deep.csv"]
 rc = subprocess.run([sys.executable, "-u"] + cmd, cwd=REPO, check=False).returncode
 if rc != 0:

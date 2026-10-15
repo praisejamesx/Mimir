@@ -82,7 +82,36 @@ def main() -> None:
 
     # ---- 1. Model ------------------------------------------------------------
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model = build_model_from_checkpoint(ckpt).to(device)
+    retrieval = "centroids_primary" in ckpt
+    if retrieval:
+        from retrieval import ProjectionHead
+        from mimir_v3 import MimirV3
+        hp = ckpt["hyperparams"]
+        assert hp.get("model", "v3") == "v3", "retrieval ckpt needs v3 encoder"
+        encoder = MimirV3(
+            n_channels=ckpt["meta"]["n_channels"],
+            n_primary_classes=ckpt["meta"]["n_primary_classes"],
+            n_moses_classes=ckpt["meta"]["n_moses_classes"],
+            f1=hp.get("f1", 16),
+            f2=hp.get("f2", 128),
+            dropout=hp.get("dropout", 0.25),
+        )
+        encoder.load_state_dict(ckpt["model_state"])
+        proj = ProjectionHead(2 * hp.get("f2", 128))
+        proj.load_state_dict(ckpt["proj_state"])
+        encoder.to(device).eval()
+        proj.to(device).eval()
+        cent_p = torch.as_tensor(ckpt["centroids_primary"]).float().to(device)
+        cent_m = torch.as_tensor(ckpt["centroids_moses"]).float().to(device)
+        submit_tau = float(ckpt.get("submit_tau", 0.2))
+        model = None
+        print(f"[submit] retrieval checkpoint: epoch {ckpt.get('epoch')} "
+              f"val_bal_Top10 {ckpt.get('val_bal_top10', float('nan')):.3f} "
+              f"tau={submit_tau}")
+    else:
+        model = build_model_from_checkpoint(ckpt).to(device)
+        encoder = proj = cent_p = cent_m = None
+        submit_tau = None
     meta = ckpt["meta"]
     print(f"[submit] checkpoint: epoch {ckpt.get('epoch')} "
           f"val_loss {ckpt.get('val_loss', float('nan')):.4f} "
@@ -115,7 +144,10 @@ def main() -> None:
     n = len(holdout)
     print(f"[submit] holdout: {counts['total']} examples, track={args.track}")
 
-    # ---- 4. Predict (softmax over both heads) --------------------------------
+    # ---- 4. Predict ----------------------------------------------------------
+    # Legacy: softmax over both classifier heads. Retrieval: cosine to
+    # per-word centroids + softmax (diverse by construction: different trials
+    # land near different centroids).
     primary_blocks: list[np.ndarray] = []
     moses_blocks: list[np.ndarray] = []
     with torch.no_grad():
@@ -124,9 +156,16 @@ def main() -> None:
             x = (x - mean[None, :, None]) / std[None, :, None]
             if clip is not None:
                 x = x.clamp(-clip, clip)                 # pnpl training clip
-            logits_p, logits_m = model(x)                # (B, 50), (B, 50)
-            primary_blocks.append(torch.softmax(logits_p, dim=1).cpu().numpy())
-            moses_blocks.append(torch.softmax(logits_m, dim=1).cpu().numpy())
+            if retrieval:
+                z = proj(encoder.encode(x))              # (B, D) L2-normed
+                primary_blocks.append(
+                    torch.softmax(z @ cent_p.T / submit_tau, dim=1).cpu().numpy())
+                moses_blocks.append(
+                    torch.softmax(z @ cent_m.T / submit_tau, dim=1).cpu().numpy())
+            else:
+                logits_p, logits_m = model(x)            # (B, 50), (B, 50)
+                primary_blocks.append(torch.softmax(logits_p, dim=1).cpu().numpy())
+                moses_blocks.append(torch.softmax(logits_m, dim=1).cpu().numpy())
 
     primary_probs = np.concatenate(primary_blocks, axis=0)
     moses_probs = np.concatenate(moses_blocks, axis=0)

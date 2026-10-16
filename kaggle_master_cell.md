@@ -84,9 +84,11 @@ os.environ["LIBRI_CACHE_MEMORY_LIMIT_BYTES"] = "24000000000"   # 24 GiB cache
 
 # ---- 4. Run: gate (3 min) or full training (hours) ----------------------------
 cmd = ["kaggle_run.py", "--overfit", "256", "--no-submit"] if GATE_ONLY else [
+    # SPRINT (final): full data (no --limit), plain CE, v3-41K. 334k trials vs
+    # ~74K params means memorization is impossible, so only shared structure
+    # fits -- the one regime never tested. Auto-sizer picks epoch count.
     "kaggle_run.py",
-    "--budget-hours", "6.5",
-    "--limit", "60000",
+    "--budget-hours", "2.5",
     "--epochs", "90",
     "--patience", "12",
     "--batch", "256",
@@ -95,9 +97,10 @@ cmd = ["kaggle_run.py", "--overfit", "256", "--no-submit"] if GATE_ONLY else [
     "--class-weights", "none",
     "--balanced-sampling",
     "--dropout", "0.25",
+    "--model", "v3",
     "--f1", "16",
     "--f2", "128",
-    "--objective", "siglip",
+    "--objective", "ce",
     "--submission", "/kaggle/working/submission_deep.csv"]
 rc = subprocess.run([sys.executable, "-u"] + cmd, cwd=REPO, check=False).returncode
 if rc != 0:
